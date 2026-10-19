@@ -9,6 +9,31 @@ Recommended compilation environment is as follows:
 - WABT >= 1.0.10
 - llvm 15 (only for multipass JIT)
 
+## Clone prerequisites
+
+Before building, initialize the git submodules and apply the WebAssembly
+compatibility-suite patch. Missing this step is the most common cause of
+confusing build / test failures on a fresh clone:
+
+```sh
+git submodule update --init --recursive
+cd tests/wast/spec && git apply ../spec.patch && cd ../..
+```
+
+`tests/wast/spec` is a `WebAssembly/spec` submodule: it must contain the
+`spec/test/core` cases used by the build. The `spec.patch` adjusts those cases
+for this project. `evmc` (EVM headers) is the other submodule and is required
+when `ZEN_ENABLE_EVM=ON`.
+
+For a guided first-day path, `./scripts/onboarding.sh` checks the environment
+(read-only, no system changes), then drives the build and test steps (see
+`README.md`). Its own regression suite covers initialized / uninitialized
+submodules and zero-test / passing / failing ctest runs:
+
+```sh
+bash scripts/test_onboarding.sh
+```
+
 ## Docker image
 
 The fastest way to set up the compilation environment is to use a Docker image or build it based on docker/Dockerfile.
@@ -149,7 +174,10 @@ When testing a single test, specify the test case name as a parameter (excluding
 
 ## Testing Custom Wast Cases
 
-When testing custom wast cases, it is recommended to create a custom directory under `tests/spec`, then place custom cases in that directory. Assuming the relative path of the custom case is `tests/spec/my/demo.wast`, then execute:
+When testing custom wast cases, create a custom directory under
+`tests/wast/spec_extra` (always compiled into the spec suite), then place
+custom cases in that directory. Assuming the relative path of the custom case
+is `tests/wast/spec_extra/my/demo.wast`, then execute:
 
 ```sh
 ./build/specUnitTests my/demo <0/1/2>

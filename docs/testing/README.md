@@ -263,11 +263,14 @@ ctest -E "evmStateTests" --verbose
 
 ### Adding WebAssembly Tests
 
-1. Create a `.wast` file in `tests/wast/spec/` or a subdirectory
+1. Create a `.wast` file in `tests/wast/spec_extra/` or a subdirectory.
+   (Do **not** put local cases in `tests/wast/spec/`: that directory is the
+   read-only upstream `WebAssembly/spec` submodule. `spec_extra` is always
+   compiled into the suite, so it is the right place for project-local cases.)
 2. Follow the WebAssembly test format with assertions
 
 ```wast
-;; tests/wast/spec/mytest/example.wast
+;; tests/wast/spec_extra/mytest/example.wast
 (module
   (func (export "add") (param i32 i32) (result i32)
     local.get 0

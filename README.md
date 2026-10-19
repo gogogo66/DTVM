@@ -59,6 +59,37 @@ Additionally, it offers native support for Intel SGX enclaves, ensuring secure e
 ## Build
 <a name="fj3o5"></a>
 
+### Before you start (clone prerequisites)
+
+First initialize the git submodules and apply the WebAssembly spec patch.
+Without this, the spec test cases (`tests/wast/spec`) and the EVM headers
+(`evmc`) are empty and the build / test will fail with confusing errors:
+
+```sh
+git submodule update --init --recursive
+cd tests/wast/spec && git apply ../spec.patch && cd ../..
+```
+
+On a Debian/Ubuntu host, install the base build dependencies (adjust the
+package names to your distribution):
+
+```sh
+sudo apt-get update && sudo apt-get install -y \
+  cmake ninja-build build-essential python3 wabt zlib1g-dev
+```
+
+> - `wabt` provides `wast2json`, which the build invokes to compile the spec
+>   test `.wast` cases; it is required when `ZEN_ENABLE_SPEC_TEST=ON`.
+> - `ninja` is optional but is what CI uses (set `DTVM_CI_USE_NINJA=1`).
+> - LLVM 15 is only needed for the multipass (Lazy JIT) mode.
+> - To avoid re-downloading FetchContent dependencies on every clean build,
+>   export `FETCHCONTENT_BASE_DIR` (see `docs/start.md` § "Build dependency
+>   cache").
+
+Ready? Pick one mode below and run its configure + build commands. A quick way
+to check the environment, configure, build and run tests in one go is
+`./scripts/onboarding.sh`.
+
 ### Lazy JIT
 
 The Lazy-JIT compilation framework (ZetaEngine) incorporates two execution modes: FLAT mode for rapid execution and FLAS mode for optimized performance. These modes can seamlessly switch between each other when Lazy-JIT is enabled.
@@ -185,7 +216,13 @@ We welcome contributions to DTVM! Before contributing, please read our [Contribu
 ## Test
 <a name="dHXF2"></a>
 ### Specification Tests （UT）
-Enable `ZEN_ENABLE_SPEC_TEST` during compilation.
+Enable `ZEN_ENABLE_SPEC_TEST` during compilation. For example, configure and
+build the spec suite (here with the default interpreter and singlepass JIT):
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DZEN_ENABLE_SPEC_TEST=ON
+cmake --build build -j$(nproc)
+```
 
 <a name="kjNq3"></a>
 #### Execute All Cases
@@ -215,7 +252,7 @@ When testing a single case, specify the case name (without the `.wast` suffix):
 ```
 <a name="LZOpW"></a>
 #### Custom wast Case Testing
-For custom `wast` tests, create a new directory under `tests/spec` and place your test there. For example, <br /> if the relative path is `tests/spec/mytest/demo.wast`, run:
+For custom `wast` tests, create a new directory under `tests/wast/spec_extra` and place your test there. This directory is always compiled into the spec suite, unlike the read-only `tests/wast/spec` submodule that contains the upstream WebAssembly conformance cases. For example, <br /> if the relative path is `tests/wast/spec_extra/mytest/demo.wast`, run:
 
 ```cpp
 ./build/specUnitTests mytest/demo <0/1/2>
