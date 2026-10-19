@@ -62,8 +62,10 @@ Additionally, it offers native support for Intel SGX enclaves, ensuring secure e
 ### Before you start (clone prerequisites)
 
 First initialize the git submodules and apply the WebAssembly spec patch.
-Without this, the spec test cases (`tests/wast/spec`) and the EVM headers
-(`evmc`) are empty and the build / test will fail with confusing errors:
+Without this, the spec test cases (`tests/wast/spec`) are empty and the build /
+test will fail with confusing errors. The `evmc` submodule only provides the
+EVM headers and is needed when configuring with `-DZEN_ENABLE_EVM=ON` (default
+off, and the default onboarding path does not enable it):
 
 ```sh
 git submodule update --init --recursive
@@ -79,7 +81,8 @@ sudo apt-get update && sudo apt-get install -y \
 ```
 
 > - `wabt` provides `wast2json`, which the build invokes to compile the spec
->   test `.wast` cases; it is required when `ZEN_ENABLE_SPEC_TEST=ON`.
+>   test `.wast` cases; it is required when `ZEN_ENABLE_SPEC_TEST=ON`
+>   (version >= 1.0.10, see `docs/start.md`).
 > - `ninja` is optional but is what CI uses (set `DTVM_CI_USE_NINJA=1`).
 > - LLVM 15 is only needed for the multipass (Lazy JIT) mode.
 > - To avoid re-downloading FetchContent dependencies on every clean build,

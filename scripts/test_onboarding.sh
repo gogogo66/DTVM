@@ -9,6 +9,8 @@
 #   3. ctest 零用例：应失败并提示未发现任何测试，不得误报“测试通过”
 #   4. ctest 测试通过：应报告“测试通过”
 #   5. ctest 测试失败：应报告“测试失败”
+#   6. test -- -R 过滤：`--` 分隔符由本脚本消化、不传给 ctest，
+#      ctest 实际收到的参数应为 `--output-on-failure -R <name>`
 #
 # 用法：bash scripts/test_onboarding.sh
 # 依赖：git；cmake/gcc/python3/wabt/ctest 等构建工具以桩替代。
@@ -51,6 +53,15 @@ assert_not_contains() { # assert_not_contains <描述> <输出> <不应出现的
     FAIL=$((FAIL+1)); printf '[FAIL] %s（输出中不应出现：%s）\n' "$name" "$want"
   else
     PASS=$((PASS+1)); printf '[ok]   %s\n' "$name"
+  fi
+}
+
+assert_eq() { # assert_eq <描述> <实际> <期望>
+  local name="$1" got="$2" want="$3"
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS+1)); printf '[ok]   %s（实际参数：%s）\n' "$name" "$got"
+  else
+    FAIL=$((FAIL+1)); printf '[FAIL] %s（期望参数：%s，实际：%s）\n' "$name" "$want" "$got"
   fi
 }
 
@@ -110,6 +121,10 @@ make_fake_bin() {
   done
   cat > "$dir/ctest" <<'EOF'
 #!/usr/bin/env bash
+# 记录实际收到的参数，供回归断言核对；未设置 CTEST_ARGS_LOG 时静默。
+if [ -n "${CTEST_ARGS_LOG:-}" ]; then
+  printf '%s\n' "$*" > "$CTEST_ARGS_LOG"
+fi
 mode="${CTEST_MODE:-pass}"
 case "$mode" in
   zero)
@@ -184,6 +199,21 @@ out5="$(cd "$FIX1" && BUILD_DIR="$TMP/build" CTEST_MODE=fail bash scripts/onboar
 rc5=$?
 assert_rc       "场景5 测试失败 test 退出码" 1 "$rc5"
 assert_contains "场景5 报告测试失败" "$out5" "测试失败"
+
+# ---- 场景 6：test -- -R 过滤，`--` 不传给 ctest ------------------------------
+
+rm -f "$TMP/ctest-args.log"
+out6="$(cd "$FIX1" && BUILD_DIR="$TMP/build" CTEST_MODE=pass CTEST_ARGS_LOG="$TMP/ctest-args.log" \
+  bash scripts/onboarding.sh test -- -R spec 2>&1)"
+rc6=$?
+assert_rc       "场景6 -R 过滤 test 退出码" 0 "$rc6"
+assert_contains "场景6 报告测试通过" "$out6" "测试通过"
+if [ -f "$TMP/ctest-args.log" ]; then
+  args6="$(cat "$TMP/ctest-args.log")"
+else
+  args6="<ctest 未记录参数>"
+fi
+assert_eq       "场景6 ctest 实际收到参数（无 --）" "$args6" "--output-on-failure -R spec"
 
 # ---- 汇总 -------------------------------------------------------------------
 

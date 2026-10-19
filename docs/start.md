@@ -28,7 +28,8 @@ when `ZEN_ENABLE_EVM=ON`.
 For a guided first-day path, `./scripts/onboarding.sh` checks the environment
 (read-only, no system changes), then drives the build and test steps (see
 `README.md`). Its own regression suite covers initialized / uninitialized
-submodules and zero-test / passing / failing ctest runs:
+submodules, zero-test / passing / failing ctest runs, and `test -- -R`
+filter argument forwarding (the `--` separator must not reach ctest):
 
 ```sh
 bash scripts/test_onboarding.sh

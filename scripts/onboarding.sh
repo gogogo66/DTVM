@@ -15,6 +15,7 @@
 #   ./scripts/onboarding.sh check      仅检查环境（不修改任何文件）
 #   ./scripts/onboarding.sh build      配置并构建
 #   ./scripts/onboarding.sh test       运行构建产物中的 spec 测试
+#   ./scripts/onboarding.sh test -- -R <name>  只运行名称匹配的用例（-- 不传给 ctest）
 #   ./scripts/onboarding.sh --help     打印本帮助
 #
 # 可用环境变量（可选）：
@@ -162,7 +163,7 @@ check_env() {
   require gcc      9.4     build-essential  "gcc"
   require g++      9.4     build-essential  "g++"
   require python3  3.8     python3          "python3"
-  require wast2json 0      wabt             "wast2json(wabt)"
+  require wast2json 1.0.10 wabt             "wast2json(wabt)"
 
   headline "可选 / 强烈建议的工具"
   discover ninja  "ninja（CI 使用，可选）"
@@ -214,6 +215,11 @@ run_tests() {
     return 1
   fi
   info "运行 ctest（可指定用例：./scripts/onboarding.sh test -- -R <name>）"
+  # `test -- -R <name>` 中的 `--` 是脚本自身的参数分隔符，不是 ctest 的
+  # 参数；直接透传会让真实 CTest 报 Unknown argument，因此先剥离。
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
   local ctest_out ctest_rc
   ctest_out="$(cd "$BUILD_DIR" && ctest --output-on-failure "$@" 2>&1)"
   ctest_rc=$?
