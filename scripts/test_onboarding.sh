@@ -11,6 +11,9 @@
 #   5. ctest 测试失败：应报告“测试失败”
 #   6. test -- -R 过滤：`--` 分隔符由本脚本消化、不传给 ctest，
 #      ctest 实际收到的参数应为 `--output-on-failure -R <name>`
+#   7. 命令名中的数字不是版本号：wast2json 的 “2” 只是命令名的一截，
+#      版本识别应提取真正输出的点分版本（如 0.9.0）并据其判定
+#   8. --version 执行失败：应判为版本检查失败，不得误判通过
 #
 # 用法：bash scripts/test_onboarding.sh
 # 依赖：git；cmake/gcc/python3/wabt/ctest 等构建工具以桩替代。
@@ -105,17 +108,30 @@ build_fixture() {
   git -C "$repo" commit -qm "repo with submodules"
 }
 
-# make_fake_bin <目录>：生成构建工具桩，避免依赖宿主是否安装这些工具。
+# make_fake_bin <目录> [工具=类型 ...]：生成构建工具桩，避免依赖宿主是否
+# 安装这些工具。默认每个工具 `--version` 输出 "version 12.34.5" 且成功；
+# 额外参数可覆盖个别工具的行为：
+#   工具=name   该工具的 `--version` 输出 "<命令名> 0.9.0"（命令名含数字，
+#               供“命令名中的数字不作为版本号”回归——同名塌起旧版本应被识别）
+#   工具=fail   `--version` 以非零状态退出（供“--version 失败=检查失败”回归）
 # ctest 桩按 CTEST_MODE 模拟 通过(pass)/失败(fail)/零用例(zero)。
 make_fake_bin() {
-  local dir="$1" t
+  local dir="$1" t kv m
+  shift
+  local -A mode=()
+  for kv in "$@"; do mode["${kv%%=*}"]="${kv#*=}"; done
   mkdir -p "$dir"
   for t in cmake gcc g++ python3 wast2json ninja make lld; do
+    m="${mode[$t]:-}"
     {
-      # 注意：不能把命令名（如 python3）带进输出，否则 tool_version
+      # 注意：默认桩不能把命令名（如 python3）带进输出，否则旧版 tool_version
       # 会先匹配到命令名里的数字（python3 -> "3"），误判版本过旧。
       printf '#!/usr/bin/env bash\n'
-      printf 'printf "version 12.34.5\\n"\n'
+      case "$m" in
+        name) printf 'printf "%s 0.9.0\\n" "%s"\n' "$t" "$t" ;;
+        fail) printf 'exit 3\n' ;;
+        *)    printf 'printf "version 12.34.5\\n"\n' ;;
+      esac
     } > "$dir/$t"
     chmod +x "$dir/$t"
   done
@@ -214,6 +230,28 @@ else
   args6="<ctest 未记录参数>"
 fi
 assert_eq       "场景6 ctest 实际收到参数（无 --）" "$args6" "--output-on-failure -R spec"
+
+# ---- 场景 7：命令名中的数字不作为版本号（wast2json 的 “2” 只是名字） ---------
+# 桩输出 "wast2json 0.9.0"：旧实现会先匹配命令名里的 “2”，误以为版本为 “2”
+# 且通过；正确实现应提取真实点分版本 0.9.0，判定低于 wast2json 最低 1.0.10
+# 而失败。
+fake7="$TMP/fake-bin-name"
+make_fake_bin "$fake7" wast2json=name
+out7="$(cd "$FIX1" && PATH="$fake7:$PATH" bash scripts/onboarding.sh check 2>&1)"
+rc7=$?
+assert_rc        "场景7 命令名含数字 wast2json check 退出码（应失败）" 1 "$rc7"
+assert_contains  "场景7 报告真实版本 0.9.0" "$out7" "0.9.0"
+assert_contains  "场景7 提示过旧" "$out7" "过旧"
+
+# ---- 场景 8：--version 执行失败应判为版本检查失败 -----------------------------
+# 桩 gcc 的 --version 以非零退出：正确实现须报告“版本检查失败”，不得当作
+# “版本过旧”甚至“通过”。
+fake8="$TMP/fake-bin-fail"
+make_fake_bin "$fake8" gcc=fail
+out8="$(cd "$FIX1" && PATH="$fake8:$PATH" bash scripts/onboarding.sh check 2>&1)"
+rc8=$?
+assert_rc        "场景8 --version 失败 check 退出码" 1 "$rc8"
+assert_contains  "场景8 提示 --version 执行失败" "$out8" "--version 执行失败"
 
 # ---- 汇总 -------------------------------------------------------------------
 

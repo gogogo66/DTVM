@@ -62,23 +62,34 @@ ver_ge() {
   return 0
 }
 
-# 提取命令输出的第一个点分数字版本号
+# 提取命令输出的第一个点分数字版本号。
+# 只匹配“带至少一个小数点”的版本形态，避免把命令名里的孤立数字
+# （如 wast2json 中的 “2”）误当成版本；--version 以非零状态失败时返回非零。
 tool_version() {
-  local cmd out
+  local cmd out rc
   cmd="$1"
-  out="$("$cmd" --version 2>&1 | grep -oE '[0-9]+(\.[0-9]+){0,3}' | head -n1)"
+  out="$("$cmd" --version 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return 1
+  fi
+  out="$(printf '%s\n' "$out" | grep -oE '[0-9]+(\.[0-9]+){1,3}' | head -n1)"
   printf '%s' "${out:-0}"
 }
 
 # 检查必备工具（含最低版本），缺失/过旧给出提示
 require() { # require <command> <min_version> <apt_pkg_name> <描述>
-  local cmd min pkg desc ver
+  local cmd min pkg desc ver rc
   cmd="$1"; min="$2"; pkg="$3"; desc="$4"
   if ! command -v "$cmd" >/dev/null 2>&1; then
     fail "$desc 未安装($cmd)。请安装：sudo apt-get install -y $pkg"
     return 1
   fi
-  ver="$(tool_version "$cmd")"
+  ver="$(tool_version "$cmd")"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "$desc --version 执行失败($cmd)，无法判定版本。请确认 $cmd 可正常执行"
+    return 1
+  fi
   if ver_ge "$ver" "$min"; then
     ok "$desc $ver(要求 >= $min)"
   else
@@ -162,7 +173,7 @@ check_env() {
   require cmake    3.16.3  cmake            "cmake"
   require gcc      9.4     build-essential  "gcc"
   require g++      9.4     build-essential  "g++"
-  require python3  3.8     python3          "python3"
+  require python3  3.8.10  python3          "python3"
   require wast2json 1.0.10 wabt             "wast2json(wabt)"
 
   headline "可选 / 强烈建议的工具"
