@@ -14,6 +14,15 @@
 #   7. 命令名中的数字不是版本号：wast2json 的 “2” 只是命令名的一截，
 #      版本识别应提取真正输出的点分版本（如 0.9.0）并据其判定
 #   8. --version 执行失败：应判为版本检查失败，不得误判通过
+#   9. check --json 正常态：stdout 为可 json.loads 的纯 JSON（status=ready、
+#      failing=0、warning=0），人类可读信息全部在 stderr，退出码与默认 check 一致
+#   10. check --json 告警态：删除 spec.patch → status=ready_with_warnings、
+#       warning=1、failing=0，退出码仍为 0，与默认 check 一致
+#   11. check --json 失败态：未初始化子模块 → status=blocked、failing=1、
+#       退出码 1，与默认 check 一致
+#   12. 特殊字符仓库路径：含 \、\r、\t、\n（及非 ASCII）的路径，JSON 解析后
+#       repo_root 与来源逐字符一致（往返无损），否则旧实现输出非法 JSON 或失真
+#   13. 默认非 JSON 用法不回归：保留 [ok]/环境就绪 人类输出、不以 { 开头
 #
 # 用法：bash scripts/test_onboarding.sh
 # 依赖：git；cmake/gcc/python3/wabt/ctest 等构建工具以桩替代。
@@ -23,6 +32,9 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ONBOARDING="$SCRIPT_DIR/onboarding.sh"
+# JSON 断言使用的宿主 python3：必须在测试脚本把 fake-bin 加入 PATH 之前取到，
+# 否则会命中桩 python3（它的 --version 之外的调用无意义）。
+REAL_PYTHON3="$(command -v python3 || printf 'python3')"
 
 PASS=0
 FAIL=0
@@ -66,6 +78,25 @@ assert_eq() { # assert_eq <描述> <实际> <期望>
   else
     FAIL=$((FAIL+1)); printf '[FAIL] %s（期望参数：%s，实际：%s）\n' "$name" "$want" "$got"
   fi
+}
+
+# assert_json_parse <描述> <json>：用宿主 python3 的 json.loads 严格校验合法 JSON，
+# 失败时打印输出头部前 15 行供定位。
+assert_json_parse() {
+  local name="$1" j="$2"
+  if "$REAL_PYTHON3" -c 'import json, sys; json.loads(sys.argv[1])' "$j" 2>/dev/null; then
+    PASS=$((PASS+1)); printf '[ok]   %s\n' "$name"
+  else
+    FAIL=$((FAIL+1)); printf '[FAIL] %s（stdout 不是合法 JSON）\n' "$name"
+    printf '%s\n' "$j" | sed 's/^/       | /' | head -n 15
+  fi
+}
+
+# json_query <json> <python 表达式>：在 json.loads 后的对象 o 上求值并打印结果。
+json_query() {
+  "$REAL_PYTHON3" -c 'import json, sys
+o = json.loads(sys.argv[1])
+print(eval(sys.argv[2]))' "$1" "$2" 2>/dev/null
 }
 
 # ---- 沙箱构造 ----------------------------------------------------------------
@@ -252,6 +283,98 @@ out8="$(cd "$FIX1" && PATH="$fake8:$PATH" bash scripts/onboarding.sh check 2>&1)
 rc8=$?
 assert_rc        "场景8 --version 失败 check 退出码" 1 "$rc8"
 assert_contains  "场景8 提示 --version 执行失败" "$out8" "--version 执行失败"
+
+# ---- 场景 9：check --json 正常态（ready）+ stdout/stderr 分离 ------------------
+# 环境全部通过时，stdout 必须是可被 python3 json.loads 解析的纯 JSON，status=ready、
+# failing=0、warning=0；人类可读信息应全部在 stderr，不得泄漏进 stdout；退出码与
+# 默认 check（场景1 rc1）一致。
+out9="$(cd "$FIX1" && bash scripts/onboarding.sh check --json 2>"$TMP/json9.err")"
+rc9=$?
+err9="$(cat "$TMP/json9.err")"
+assert_rc            "场景9 JSON 正常态 check 退出码" 0 "$rc9"
+assert_json_parse    "场景9 stdout 可被 json.loads 解析" "$out9"
+assert_eq            "场景9 status" "$(json_query "$out9" "o['status']")" "ready"
+assert_eq            "场景9 failing" "$(json_query "$out9" "o['failing']")" "0"
+assert_eq            "场景9 warning" "$(json_query "$out9" "o['warning']")" "0"
+assert_eq            "场景9 mode" "$(json_query "$out9" "o['mode']")" "check"
+assert_eq            "场景9 tool" "$(json_query "$out9" "o['tool']")" "scripts/onboarding.sh"
+assert_eq            "场景9 checks 非空" "$(json_query "$out9" "len(o['checks']) >= 1")" "True"
+assert_eq            "场景9 git 检查项为 ok" "$(json_query "$out9" "any(c['name']=='git' and c['status']=='ok' for c in o['checks'])")" "True"
+assert_eq            "场景9 JSON 与默认 check 退出码一致" "$rc9" "$rc1"
+case "${out9:0:1}" in
+  "{") PASS=$((PASS+1)); printf '[ok]   场景9 stdout 以 { 开头\n' ;;
+  *)   FAIL=$((FAIL+1)); printf '[FAIL] 场景9 stdout 应以 { 开头，实际前缀：%s\n' "${out9:0:20}" ;;
+esac
+assert_not_contains  "场景9 stdout 不含人类可读标记" "$out9" "[ok]"
+assert_contains      "场景9 人类信息在 stderr（含 [ok]）" "$err9" "[ok]"
+assert_contains      "场景9 stderr 报告环境就绪" "$err9" "环境就绪"
+
+# ---- 场景 10：check --json 告警态（ready_with_warnings）------------------------
+# 删除 spec.patch → spec-patch 检查项为 warn；warn 不阻塞构建，退出码仍为 0，
+# JSON status 应为 ready_with_warnings、warning=1、failing=0，与默认 check 一致。
+FIX10="$TMP/fixture-warn/repo"
+cp -a "$TMP/fixture-ok" "$TMP/fixture-warn"
+rm -f "$FIX10/tests/wast/spec.patch"
+out10="$(cd "$FIX10" && bash scripts/onboarding.sh check --json 2>"$TMP/json10.err")"
+rc10=$?
+err10="$(cat "$TMP/json10.err")"
+out10d="$(cd "$FIX10" && bash scripts/onboarding.sh check 2>&1)"
+rc10d=$?
+assert_rc            "场景10 JSON 告警态 check 退出码" 0 "$rc10"
+assert_rc            "场景10 告警态默认 check 退出码" 0 "$rc10d"
+assert_json_parse    "场景10 stdout 可被 json.loads 解析" "$out10"
+assert_eq            "场景10 status" "$(json_query "$out10" "o['status']")" "ready_with_warnings"
+assert_eq            "场景10 failing" "$(json_query "$out10" "o['failing']")" "0"
+assert_eq            "场景10 warning" "$(json_query "$out10" "o['warning']")" "1"
+assert_eq            "场景10 spec-patch 项为 warn" "$(json_query "$out10" "sum(1 for c in o['checks'] if c['name']=='spec-patch' and c['status']=='warn')")" "1"
+assert_eq            "场景10 JSON 与默认 check 退出码一致" "$rc10" "$rc10d"
+assert_contains      "场景10 stderr 提示未找到 spec.patch" "$err10" "未找到 spec.patch"
+
+# ---- 场景 11：check --json 失败态（blocked）------------------------------------
+# deinit 子模块 → git-submodules 为 fail；JSON status 应为 blocked、failing=1、
+# 退出码 1，与默认 check（场景2 rc2=1）一致。
+out11="$(cd "$FIX2" && bash scripts/onboarding.sh check --json 2>"$TMP/json11.err")"
+rc11=$?
+err11="$(cat "$TMP/json11.err")"
+assert_rc            "场景11 JSON 失败态 check 退出码" 1 "$rc11"
+assert_json_parse    "场景11 stdout 可被 json.loads 解析" "$out11"
+assert_eq            "场景11 status" "$(json_query "$out11" "o['status']")" "blocked"
+assert_eq            "场景11 failing" "$(json_query "$out11" "o['failing']")" "1"
+assert_eq            "场景11 存在 fail 检查项" "$(json_query "$out11" "sum(1 for c in o['checks'] if c['status']=='fail') >= 1")" "True"
+assert_eq            "场景11 JSON 与默认 check 退出码一致" "$rc11" "$rc2"
+assert_contains      "场景11 stderr 报告环境未就绪" "$err11" "环境未就绪"
+
+# ---- 场景 12：含特殊字符仓库路径的 JSON 往返（\、\r、\t、\n、非 ASCII）---------
+# 旧实现对反斜杠不转义、\r 原样输出（非法 JSON）、\t/\n 双重转义成 \\t/\\n
+# （解析后成“反斜杠+字母”的失真路径）。此处要求 json.loads 解析后 repo_root
+# 与真实路径逐字符一致（往返无损），并核对默认 check 退出码同为 0。
+SPECIAL_ROOT="$TMP/"$'special\\path\r\t\n-目录'
+cp -a "$TMP/fixture-ok" "$SPECIAL_ROOT"
+out12="$(cd "$SPECIAL_ROOT/repo" && bash scripts/onboarding.sh check --json 2>"$TMP/json12.err")"
+rc12=$?
+out12d="$(cd "$SPECIAL_ROOT/repo" && bash scripts/onboarding.sh check 2>&1)"
+rc12d=$?
+assert_rc            "场景12 特殊路径 check --json 退出码" 0 "$rc12"
+assert_rc            "场景12 特殊路径默认 check 退出码" 0 "$rc12d"
+assert_json_parse    "场景12 stdout 可被 json.loads 解析" "$out12"
+assert_eq            "场景12 status" "$(json_query "$out12" "o['status']")" "ready"
+root12="$(json_query "$out12" "o['repo_root']")"
+if [ "$root12" = "$SPECIAL_ROOT/repo" ]; then
+  PASS=$((PASS+1)); printf '[ok]   场景12 repo_root 往返逐字符一致：%q\n' "$SPECIAL_ROOT/repo"
+else
+  FAIL=$((FAIL+1)); printf '[FAIL] 场景12 repo_root 往返：期望 %q，实际 %q\n' "$SPECIAL_ROOT/repo" "$root12"
+fi
+
+# ---- 场景 13：默认（非 JSON）用法不回归 ----------------------------------------
+# check（无 --json）输出维持人类可读格式：含 [ok]/环境就绪、不以 { 开头、
+# 不含 JSON 专有字段；退出码一致性由场景 9/10/11 分别与默认态比对完成。
+assert_contains      "场景13 默认输出保留 [ok] 标记" "$out1" "[ok]"
+assert_contains      "场景13 默认输出报告环境就绪" "$out1" "环境就绪"
+assert_not_contains  "场景13 默认输出不含 JSON 字段" "$out1" '"schema_version"'
+case "${out1:0:1}" in
+  "{") FAIL=$((FAIL+1)); printf '[FAIL] 场景13 默认输出不应以 { 开头\n' ;;
+  *)   PASS=$((PASS+1)); printf '[ok]   场景13 默认输出不是 JSON\n' ;;
+esac
 
 # ---- 汇总 -------------------------------------------------------------------
 

@@ -13,6 +13,8 @@
 # 用法
 #   ./scripts/onboarding.sh            等价于 check -> build -> test
 #   ./scripts/onboarding.sh check      仅检查环境（不修改任何文件）
+#   ./scripts/onboarding.sh check --json  检查环境并以结构化 JSON 输出（供 CI 解析；
+#                                      人类可读信息写到 stderr，stdout 只含 JSON）
 #   ./scripts/onboarding.sh build      配置并构建
 #   ./scripts/onboarding.sh test       运行构建产物中的 spec 测试
 #   ./scripts/onboarding.sh test -- -R <name>  只运行名称匹配的用例（-- 不传给 ctest）
@@ -42,12 +44,56 @@ fi
 FAILED=0     # 1 = 存在必须修复的问题
 WARNED=0     # 1 = 存在建议关注的问题（不阻塞构建）
 
+# JSON 模式（check --json 时置 1）：仅用于环境检查；人类可读信息改写到 stderr，
+# stdout 只保留可被 CI 解析的结构化 JSON。默认模式不变，等价于原有用例。
+JSON_MODE=0
+JSON_ITEMS=()
+
 dashed()  { printf "${C_DIM}%${2:-72}s${C_RESET}\n" "" | tr ' ' "${1:--}"; }
 info()    { printf "${C_DIM}%s${C_RESET}\n" "$*"; }
 warn()    { printf "${C_WARN}[!]${C_RESET} %s\n" "$*"; }
 fail()    { FAILED=1; printf "${C_FAIL}[x]${C_RESET} %s\n" "$*"; }
 ok()      { printf "${C_OK}[ok]${C_RESET} %s\n" "$*"; }
 headline(){ printf "\n${C_BOLD}== %s ==${C_RESET}\n" "$*"; }
+
+# JSON 字符串转义：\" \\ 以及全部 ASCII 控制符（含 \r）必须编码，否则
+# python3 json.loads 会报 Invalid \escape / Invalid control character，含
+# 制表符/换行时解析后的路径也会失真（\\t/\\n 会还原成反斜杠+字母）。
+# 编码规则：\" -> \\"；\\ -> \\\\；TAB/LF/CR -> \\t/\\n/\\r；其余控制符
+# （0x00-0x1F）-> \\u00XX；非 ASCII（UTF-8）内容原样保留。逐字符取码点
+# 比较，可规避 case 模式里反斜杠转义语义在不同 bash 版本间的差异。
+json_escape() {
+  local s="$1" out="" i ch n code esc
+  n="${#s}"
+  for ((i=0; i<n; i++)); do
+    ch="${s:i:1}"
+    printf -v code '%d' "'$ch"
+    case "$code" in
+      34)  out+='\"' ;;                 # "
+      92)  out+='\\' ;;                 # \ -> 必须写成 \\ 才是合法 JSON
+      9)   out+='\t' ;;                 # TAB
+      10)  out+='\n' ;;                 # LF
+      13)  out+='\r' ;;                 # CR
+      *)   if [ "$code" -lt 32 ]; then
+             printf -v esc '\\u%04x' "$code"
+             out+="$esc"
+           else
+             out+="$ch"
+           fi ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# 环境检查项登记：仅在 JSON 模式下累计，供末尾 emit_env_json 汇总输出。
+# record_item <category> <status> <name> <message>
+# category: required_tools | optional_tools | filesystem | repository
+# status  : ok | warn | fail
+record_item() {
+  if [ "$JSON_MODE" = "1" ]; then
+    JSON_ITEMS+=("{ \"category\": \"$(json_escape "$1")\", \"name\": \"$(json_escape "$3")\", \"status\": \"$(json_escape "$2")\", \"detail\": \"$(json_escape "$4")\" }")
+  fi
+}
 
 # 点分数字版本比较：$1 >= $2
 ver_ge() {
@@ -82,17 +128,21 @@ require() { # require <command> <min_version> <apt_pkg_name> <描述>
   local cmd min pkg desc ver rc
   cmd="$1"; min="$2"; pkg="$3"; desc="$4"
   if ! command -v "$cmd" >/dev/null 2>&1; then
+    record_item required_tools fail "$cmd" "$desc 未安装($cmd)。请安装：sudo apt-get install -y $pkg"
     fail "$desc 未安装($cmd)。请安装：sudo apt-get install -y $pkg"
     return 1
   fi
   ver="$(tool_version "$cmd")"; rc=$?
   if [ "$rc" -ne 0 ]; then
+    record_item required_tools fail "$cmd" "$desc --version 执行失败($cmd)，无法判定版本。请确认 $cmd 可正常执行"
     fail "$desc --version 执行失败($cmd)，无法判定版本。请确认 $cmd 可正常执行"
     return 1
   fi
   if ver_ge "$ver" "$min"; then
+    record_item required_tools ok "$cmd" "$desc $ver(要求 >= $min)"
     ok "$desc $ver(要求 >= $min)"
   else
+    record_item required_tools fail "$cmd" "$desc $ver 过旧(要求 >= $min)。请升级：sudo apt-get install -y $pkg"
     fail "$desc $ver 过旧(要求 >= $min)。请升级：sudo apt-get install -y $pkg"
   fi
 }
@@ -101,8 +151,10 @@ discover() { # discover <command> <描述>  // 可选工具，仅提示
   local cmd desc
   cmd="$1"; desc="$2"
   if command -v "$cmd" >/dev/null 2>&1; then
+    record_item optional_tools ok "$cmd" "$desc($(tool_version "$cmd"))"
     ok "$desc($(tool_version "$cmd"))"
   else
+    record_item optional_tools warn "$cmd" "$desc 未安装($cmd)。可选但推荐：sudo apt-get install -y $(printf '%s' "$cmd" | sed -e 's/^wast2json$/wabt/' -e 's/^ninja$/ninja-build/')"
     warn "$desc 未安装($cmd)。可选但推荐：sudo apt-get install -y $(printf '%s' "$cmd" | sed -e 's/^wast2json$/wabt/' -e 's/^ninja$/ninja-build/')"
   fi
 }
@@ -112,6 +164,7 @@ check_submodules() {
   dashed
   info "检查 git 子模块（tests/wast/spec、evmc）…"
   if [ ! -e "$REPO_ROOT/.gitmodules" ]; then
+    record_item repository ok "git-submodules" "无子模块配置，跳过"
     ok "无子模块配置，跳过"
     return 0
   fi
@@ -120,13 +173,16 @@ check_submodules() {
     st="${line:0:1}"
     path="${line#* }"; path="${path%% *}"
     if [ "$st" = "-" ]; then
+      record_item repository warn "git-submodules" "子模块未初始化：$path"
       warn "子模块未初始化：$path"
       missing=1
     fi
   done < <(git -C "$REPO_ROOT" submodule status 2>/dev/null)
   if [ "$missing" = "1" ]; then
+    record_item repository fail "git-submodules" "请先初始化子模块：git submodule update --init --recursive"
     fail "请先初始化子模块：git submodule update --init --recursive"
   else
+    record_item repository ok "git-submodules" "子模块均已初始化"
     ok "子模块均已初始化"
   fi
 }
@@ -140,16 +196,20 @@ check_spec_patch() {
   # 标准 git 子模块的 .git 是 gitfile（文件，内容为 gitdir: …），不能用
   # -d 判断是否初始化；存在性 + rev-parse 可同时覆盖目录与 gitfile 布局。
   if [ ! -e "$specdir/.git" ] || ! git -C "$specdir" rev-parse --git-dir >/dev/null 2>&1; then
+    record_item repository fail "spec-patch" "tests/wast/spec 尚未初始化（先执行 git submodule update --init --recursive），spec.patch 无从应用"
     fail "tests/wast/spec 尚未初始化（先执行 git submodule update --init --recursive），spec.patch 无从应用"
     return 1
   fi
   if [ ! -f "$patchfile" ]; then
+    record_item repository warn "spec-patch" "未找到 spec.patch($patchfile)，跳过补丁检查"
     warn "未找到 spec.patch($patchfile)，跳过补丁检查"
     return 0
   fi
   if git -C "$specdir" apply --reverse --check "$patchfile" >/dev/null 2>&1; then
+    record_item repository ok "spec-patch" "spec.patch 已应用"
     ok "spec.patch 已应用"
   else
+    record_item repository fail "spec-patch" "请应用补丁：cd tests/wast/spec && git apply ../spec.patch"
     fail "请应用补丁：cd tests/wast/spec && git apply ../spec.patch"
   fi
 }
@@ -157,8 +217,10 @@ check_spec_patch() {
 # 可选系统库（头文件存在性，不阻塞）
 check_zlib() {
   if [ -f /usr/include/zlib.h ] || [ -f /usr/local/include/zlib.h ]; then
+    record_item filesystem ok "zlib.h" "zlib 开发头文件存在"
     ok "zlib 开发头文件存在"
   else
+    record_item filesystem warn "zlib.h" "未找到 zlib.h（zlib1g-dev）。可选：sudo apt-get install -y zlib1g-dev"
     warn "未找到 zlib.h（zlib1g-dev）。可选：sudo apt-get install -y zlib1g-dev"
   fi
 }
@@ -199,6 +261,47 @@ check_env() {
     printf "${C_OK}环境就绪，可以开始构建。${C_RESET}\n"
   fi
   return 0
+}
+
+# 输出结构化 JSON 结果（仅 check --json 时调用）。
+# checks[] 逐条汇总每个环境检查项；整体 status 便于 CI 快速做门禁：
+# blocked=必须修复；ready_with_warnings=存在可选优化点；ready=就绪。
+# 注意：warning 聚合由 checks[] 中实际出现的 warn 项推导，而不是读 WARNED 全局
+# （原脚本 warn() 只打印不置位，默认输出保持不变；JSON 需与可见行为一致）。
+emit_env_json() {
+  local status first it list="" has_warn=0
+  first=1
+  for it in "${JSON_ITEMS[@]}"; do
+    if [ "$first" = "1" ]; then first=0; else list+=","; fi
+    case "$it" in *'"status": "warn"'*) has_warn=1 ;; esac
+    list+="$it"
+  done
+  if [ "$FAILED" = "1" ]; then
+    status="blocked"
+  elif [ "$has_warn" = "1" ]; then
+    status="ready_with_warnings"
+  else
+    status="ready"
+  fi
+  printf '{\n'
+  printf '  "schema_version": 1,\n'
+  printf '  "tool": "scripts/onboarding.sh",\n'
+  printf '  "mode": "check",\n'
+  printf '  "repo_root": "%s",\n' "$(json_escape "$REPO_ROOT")"
+  printf '  "status": "%s",\n' "$(json_escape "$status")"
+  printf '  "failing": %d,\n' "$FAILED"
+  printf '  "warning": %d,\n' "$has_warn"
+  printf '  "checks": [%s]\n' "$list"
+  printf '}\n'
+}
+
+# check --json：人类可读信息改写到 stderr，stdout 只保留 JSON，便于 CI 解析。
+check_env_json() {
+  JSON_MODE=1
+  check_env >&2
+  local rc=$?
+  emit_env_json
+  return $rc
 }
 
 build() {
@@ -257,7 +360,12 @@ case "$cmd" in
   --help|-h)
     usage; exit 0 ;;
   check)
-    check_env ;;
+    if [ "${2:-}" = "--json" ]; then
+      check_env_json
+    else
+      check_env
+    fi
+    ;;
   build)
     check_env && build ;;
   test)
