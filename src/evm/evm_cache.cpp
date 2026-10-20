@@ -80,6 +80,10 @@ static bool isGasChunkTerminator(uint8_t OpcodeU8) {
   case evmc_opcode::OP_CALLCODE:
   case evmc_opcode::OP_DELEGATECALL:
   case evmc_opcode::OP_STATICCALL:
+  // EIP-3074 (protocol extension): dynamic gas (2929 access + memory
+  // expansion / forwarded call gas) makes AUTH/AUTHCALL chunk terminators.
+  case evmc_opcode::OP_AUTH:
+  case evmc_opcode::OP_AUTHCALL:
     return true;
   default:
     return false;
@@ -115,6 +119,11 @@ static bool isGasSensitiveTerminator(uint8_t OpcodeU8) {
   case evmc_opcode::OP_CALLCODE:
   case evmc_opcode::OP_DELEGATECALL:
   case evmc_opcode::OP_STATICCALL:
+  // EIP-3074: AUTHCALL's forwarded gas depends on the gas remaining at its
+  // own PC (and AUTH's OOG boundary depends on its dynamic costs), so moving
+  // successor costs across them can change outcomes - keep them as barriers.
+  case evmc_opcode::OP_AUTH:
+  case evmc_opcode::OP_AUTHCALL:
     return true;
   default:
     return false;

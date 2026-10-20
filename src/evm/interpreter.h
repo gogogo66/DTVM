@@ -36,6 +36,12 @@ struct EVMFrame {
   uint64_t Pc = 0;
   intx::uint256 Value = 0;
 
+  // EIP-3074 AUTH authorization state (protocol extension).  Frame-scoped:
+  // initialized unset for every frame and never inherited from the caller;
+  // only AUTH sets it and only a subsequent AUTH resets it.
+  bool HasAuthorized = false;
+  evmc_address Authorized = {};
+
   inline void push(const intx::uint256 &V) {
     if (Sp >= MAXSTACK) {
       throw getError(common::ErrorCode::EVMStackOverflow);

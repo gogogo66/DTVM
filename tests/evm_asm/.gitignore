@@ -1,1 +1,4 @@
 *.hex
+# AUTH/AUTHCALL serializer output is hand-authored (the converter has no
+# AUTH/AUTHCALL mnemonics yet) and must be tracked for EVMSampleTest.
+!authcall_*.evm.hex

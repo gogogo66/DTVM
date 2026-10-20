@@ -1,7 +1,8 @@
 # Copyright (C) 2025 the DTVM authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-set(HOST_EVM_SRCS crypto.cpp keccak/keccak.c)
+set(HOST_EVM_SRCS crypto.cpp keccak/keccak.c secp256k1/secp256k1.cpp
+                  account_nonce.cpp)
 
 add_library(host_evm OBJECT ${HOST_EVM_SRCS})
 

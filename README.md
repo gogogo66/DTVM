@@ -44,6 +44,48 @@ The DTVM Engine introduces a Lazy-JIT compilation framework(code name is **ZetaE
 
 ![DTVM Compile Framework](./resources/dtvm_lazy_jit.png)
 
+# System Architecture
+
+DTVM's architecture translates diverse input programs (Wasm, EVM, and future RISC-V) into a unified deterministic intermediate representation (dMIR), then executes them through one of three engine modes: interpreter, singlepass JIT, or multipass (lazy-JIT).
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Input Programs                                │
+│              Wasm Bytecode  │  EVM Bytecode  │  (Future: RISC-V)    │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Adaptation Layers                               │
+│         Wasm Frontend   │   EVM Frontend   │   (Future: RISC-V)     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│          Deterministic Middle Intermediate Representation (dMIR)     │
+│               Unified IR with deterministic guarantees               │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+            ┌───────────┐   ┌───────────┐   ┌───────────┐
+            │Interpreter│   │Singlepass │   │ Multipass │
+            │   Mode    │   │  JIT Mode │   │ JIT Mode  │
+            └───────────┘   └───────────┘   └───────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Native Code Execution                         │
+│                      x86-64  │  ARM64 (singlepass only)              │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+- **Interpreter Mode**: direct bytecode interpretation, lowest startup latency, platform-independent.
+- **Singlepass JIT Mode**: single-pass compilation to native code; supports x86-64 and ARM64 (no LLVM dependency).
+- **Multipass (Lazy-JIT) Mode**: LLVM-based multi-pass optimization with `FLAT` (rapid function-level transpile) and `FLAS` (adaptive hot-switching) sub-modes; x86-64 only, requires LLVM 15.
+
+For a detailed breakdown of modules, compilation pipelines, and platform support, see [docs/architecture/README.md](docs/architecture/README.md).
+
 # Introduction
 
 ZetaEngine currently supports three execution modes: `lazy-jit` mode (also known as `multipass`, which includes `FLAT` and `FLAS` modes), `singlepass` mode, and `interpreter` mode.

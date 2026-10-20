@@ -3,6 +3,7 @@
 
 #include "host/evm/crypto.h"
 #include "host/evm/keccak/keccak.hpp"
+#include "host/evm/secp256k1/secp256k1.hpp"
 #include <array>
 #include <cstring>
 
@@ -26,6 +27,18 @@ std::vector<uint8_t> CryptoHost::keccak256(const std::vector<uint8_t> &Input) {
   return Result;
 }
 
+bool CryptoHost::ec_recover(const uint8_t *Digest, const uint8_t *R,
+                            const uint8_t *S, uint8_t YParity,
+                            uint8_t *OutAddress) {
+  uint8_t PubKey[64];
+  if (!secp256k1::recoverPublicKey(Digest, R, S, YParity, PubKey)) {
+    return false;
+  }
+  const auto Hash = ethash::keccak256(PubKey, sizeof(PubKey));
+  std::memcpy(OutAddress, Hash.bytes + 32 - 20, 20);
+  return true;
+}
+
 // Convenience functions
 void keccak256(const uint8_t *Input, size_t InputLen, uint8_t *Output) {
   CryptoProvider::getInstance().keccak256(Input, InputLen, Output);
@@ -33,6 +46,12 @@ void keccak256(const uint8_t *Input, size_t InputLen, uint8_t *Output) {
 
 std::vector<uint8_t> keccak256(const std::vector<uint8_t> &Input) {
   return CryptoProvider::getInstance().keccak256(Input);
+}
+
+bool ec_recover(const uint8_t *Digest, const uint8_t *R, const uint8_t *S,
+                uint8_t YParity, uint8_t *OutAddress) {
+  return CryptoProvider::getInstance().ec_recover(Digest, R, S, YParity,
+                                                  OutAddress);
 }
 
 } // namespace zen::host::evm::crypto

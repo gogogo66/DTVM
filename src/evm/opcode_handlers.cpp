@@ -7,6 +7,7 @@
 #include "evm/interpreter.h"
 #include "evmc/evmc.h"
 #include "evmc/instructions.h"
+#include "host/evm/account_nonce.h"
 #include "host/evm/crypto.h"
 #include "runtime/evm_instance.h"
 
@@ -180,6 +181,11 @@ DEFINE_NOT_TEMPLATE_CALCULATE_GAS(JumpDest, OP_JUMPDEST);
 DEFINE_NOT_TEMPLATE_CALCULATE_GAS(TLoad, OP_TLOAD);
 DEFINE_NOT_TEMPLATE_CALCULATE_GAS(TStore, OP_TSTORE);
 DEFINE_NOT_TEMPLATE_CALCULATE_GAS(MCopy, OP_MCOPY);
+
+// EIP-3074 (protocol extension): AUTH base 3100; AUTHCALL base mirrors CALL
+// (WARM_STORAGE_READ_COST = 100, dynamic costs charged in the handlers).
+DEFINE_NOT_TEMPLATE_CALCULATE_GAS(Auth, OP_AUTH);
+DEFINE_NOT_TEMPLATE_CALCULATE_GAS(AuthCall, OP_AUTHCALL);
 
 // Environment operations
 DEFINE_NOT_TEMPLATE_CALCULATE_GAS(PC, OP_PC);
@@ -1442,6 +1448,252 @@ void CallHandler::doExecute() {
 
   // Track subcall refund at Instance level (may be negative)
   Context->getInstance()->addGasRefund(Result.gas_refund);
+  Context->setStatus(EVMC_SUCCESS);
+}
+
+void AuthHandler::doExecute() {
+  auto *Frame = getFrame();
+  auto *Context = getContext();
+  EVM_FRAME_CHECK(Frame);
+
+  EVM_STACK_CHECK(Frame, 3);
+  const auto Authority = intx::be::trunc<evmc::address>(Frame->pop());
+  const auto Offset = Frame->pop();
+  const auto Length = Frame->pop();
+  EVM_REQUIRE_STACK_SPACE(Frame, 1);
+
+  // EIP-2929: charge the account-access cost for the authority (warm 100 /
+  // cold 2600).  The AUTH base cost (3100) does not include this component;
+  // the opcode is Osaka-gated, so EIP-2929 semantics always apply.
+  const uint64_t AccessCost =
+      Frame->Host->access_account(Authority) == EVMC_ACCESS_COLD
+          ? COLD_ACCOUNT_ACCESS_COST
+          : WARM_STORAGE_READ_COST;
+  if (!chargeGas(Frame, AccessCost)) {
+    Context->setStatus(EVMC_OUT_OF_GAS);
+    return;
+  }
+
+  // Memory expansion for the declared signature region.  EIP-3074 reads up to
+  // 97 bytes at Offset; the full Length is charged like RETURN-style memory
+  // expansion and bytes past Length read as zero.
+  if (!checkMemoryExpandAndChargeGas(Frame, Offset, Length)) {
+    Context->setStatus(EVMC_OUT_OF_GAS);
+    return;
+  }
+
+  // Read yParity(1) ‖ r(32) ‖ s(32) ‖ commit(32) with zero padding: bytes
+  // beyond the declared Length read as zero (EIP-3074 semantics).
+  uint8_t Sig[97] = {0};
+  const uint64_t Length64 = uint256ToUint64(Length);
+  const uint64_t Offset64 = Length64 == 0 ? 0 : uint256ToUint64(Offset);
+  const uint64_t SigLen = std::min<uint64_t>(Length64, 97);
+  const size_t Available = (Offset64 < Frame->Memory.size())
+                               ? Frame->Memory.size() - Offset64
+                               : 0;
+  const size_t CopyLen = std::min<size_t>(SigLen, Available);
+  if (CopyLen > 0) {
+    std::memcpy(Sig, Frame->Memory.data() + Offset64, CopyLen);
+  }
+
+  // EIP-3074: an authority that has code can never be authenticated.
+  bool Authorized = false;
+  if (Frame->Host->get_code_size(Authority) == 0) {
+    // EIP-3074 message:
+    //   keccak256(0x04 ‖ chainId(32) ‖ nonce(32) ‖ invoker(32) ‖ commit(32))
+    // nonce  = signer's (authority's) current account nonce;
+    // invoker = the address of the contract executing AUTH (the recipient of
+    // the current message; under CALLCODE/DELEGATECALL this is the active
+    // state address).
+    uint8_t Msg[129];
+    Msg[0] = 0x04;
+    const auto &TxCtx = Frame->getTxContext();
+    std::memcpy(Msg + 1, TxCtx.chain_id.bytes, 32);
+    const uint64_t Nonce =
+        host::evm::getAccountNonce(Frame->Host, Authority);
+    const auto NonceBytes =
+        intx::be::store<evmc::bytes32>(intx::uint256(Nonce));
+    std::memcpy(Msg + 33, NonceBytes.bytes, 32);
+    std::memset(Msg + 65, 0, 12);
+    std::memcpy(Msg + 65 + 12, Frame->Msg.recipient.bytes,
+                sizeof(Frame->Msg.recipient.bytes));
+    std::memcpy(Msg + 97, Sig + 65, 32);
+
+    uint8_t Digest[32];
+    host::evm::crypto::keccak256(Msg, sizeof(Msg), Digest);
+
+    uint8_t Recovered[20];
+    if (host::evm::crypto::ec_recover(Digest, Sig + 1, Sig + 33, Sig[0],
+                                      Recovered) &&
+        std::memcmp(Recovered, Authority.bytes, sizeof(Authority.bytes)) == 0) {
+      Authorized = true;
+    }
+  }
+
+  // AUTH does not reset the authorization when it succeeds; any failure
+  // (invalid signature, mismatched signer, authority with code) clears it.
+  Frame->HasAuthorized = Authorized;
+  Frame->Authorized = Authorized ? Authority : evmc::address{};
+  Frame->push(intx::uint256(Authorized ? 1 : 0));
+}
+
+void AuthCallHandler::doExecute() {
+  auto *Frame = getFrame();
+  auto *Context = getContext();
+  EVM_FRAME_CHECK(Frame);
+
+  // EIP-3074: AUTHCALL is only valid when AUTH succeeded in this frame;
+  // otherwise it is an invalid execution (the interpreter zeroes the frame's
+  // remaining gas for non-REVERT statuses - see handleExecutionStatus).
+  if (!Frame->HasAuthorized) {
+    Context->setStatus(EVMC_INVALID_INSTRUCTION);
+    return;
+  }
+
+  EVM_STACK_CHECK(Frame, 7);
+  const auto Gas = Frame->pop();
+  auto Dest = intx::be::trunc<evmc::address>(Frame->pop());
+  const auto Value = Frame->pop();
+  const auto InputOffset = Frame->pop();
+  const auto InputSize = Frame->pop();
+  const auto OutputOffset = Frame->pop();
+  const auto OutputSize = Frame->pop();
+  const bool HasValue = Value != 0;
+
+  // Assume failure
+  EVM_REQUIRE_STACK_SPACE(Frame, 1);
+  Frame->push(0);
+  Context->clearReturnData();
+
+  // EIP-2929: the base cost (WARM_STORAGE_READ_COST = 100, the AUTHCALL
+  // metrics row) is already charged by execute()/chunk precharge; charge only
+  // the ADDITIONAL cold-access cost (mirrors CallHandler).
+  if (Frame->Host->access_account(Dest) == EVMC_ACCESS_COLD) {
+    if (!chargeGas(Frame, ADDITIONAL_COLD_ACCOUNT_ACCESS_COST)) {
+      Context->setStatus(EVMC_OUT_OF_GAS);
+      return;
+    }
+  }
+
+  // Memory expansion (same as CALL).
+  if (!checkMemoryExpandAndChargeGas(Frame, InputOffset, InputSize)) {
+    Context->setStatus(EVMC_OUT_OF_GAS);
+    return;
+  }
+  if (!checkMemoryExpandAndChargeGas(Frame, OutputOffset, OutputSize)) {
+    Context->setStatus(EVMC_OUT_OF_GAS);
+    return;
+  }
+
+  // Static-mode rejection (acceptance criterion; mirrors the CALL family's
+  // EVMC_STATIC_MODE_VIOLATION decision noted in the research contract).
+  if (Frame->isStaticMode()) {
+    Context->setStatus(EVMC_STATIC_MODE_VIOLATION);
+    return;
+  }
+
+  // EIP-3074 dynamic gas: value transfers cost 6700 (NOT CALL's 9000) and an
+  // empty target adds 25000 (EIP-161 empty-account semantics).
+  const bool TargetIsEmpty =
+      host::evm::getAccountNonce(Frame->Host, Dest) == 0 &&
+      intx::be::load<intx::uint256>(Frame->Host->get_balance(Dest)) == 0 &&
+      Frame->Host->get_code_size(Dest) == 0;
+  uint64_t DynamicCost = HasValue ? AUTHCALL_VALUE_COST : 0;
+  if (TargetIsEmpty) {
+    DynamicCost += ACCOUNT_CREATION_COST;
+  }
+  if (!chargeGas(Frame, DynamicCost)) {
+    Context->setStatus(EVMC_OUT_OF_GAS);
+    return;
+  }
+
+  // EIP-3074 gas forwarding (EIP-150 63/64 rule, exact formulation):
+  //   all_but_one_64th = remaining_gas - remaining_gas / 64
+  //   gas == 0            -> subcall_gas = all_but_one_64th
+  //   all_but_one_64th < gas -> invalid execution
+  //   otherwise           -> subcall_gas = gas
+  const uint64_t GasLeft = static_cast<uint64_t>(Frame->Msg.gas);
+  const uint64_t AllButOne64th = GasLeft - GasLeft / 64;
+  uint64_t CallGas = uint256ToUint64(Gas);
+  if (CallGas == 0) {
+    CallGas = AllButOne64th;
+  } else if (AllButOne64th < CallGas) {
+    Context->setStatus(EVMC_INVALID_INSTRUCTION);
+    return;
+  }
+
+  // The value is taken from the authorized account's balance; exceeding it is
+  // an invalid execution.  There is no 2300 stipend for AUTHCALL.
+  if (HasValue) {
+    const auto AuthorizedBalance = intx::be::load<intx::uint256>(
+        Frame->Host->get_balance(Frame->Authorized));
+    if (AuthorizedBalance < Value) {
+      Context->setStatus(EVMC_INVALID_INSTRUCTION);
+      return;
+    }
+  }
+
+  if (Frame->Msg.depth >= MAXSTACK) {
+    Context->setStatus(EVMC_SUCCESS); // "Light" failure
+    return;
+  }
+
+  uint64_t InputSize64 = static_cast<uint64_t>(InputSize);
+  uint64_t InputOffset64 =
+      InputSize64 == 0 ? 0 : static_cast<uint64_t>(InputOffset);
+  uint64_t OutputSize64 = static_cast<uint64_t>(OutputSize);
+  uint64_t OutputOffset64 =
+      OutputSize64 == 0 ? 0 : static_cast<uint64_t>(OutputOffset);
+
+  // The subcall's caller is the authorized address (EIP-3074).  Code address
+  // is Dest itself: unlike CALL, no EIP-7702 delegation resolution is applied
+  // (the spec predates it and its dynamic-gas model has no delegate-access
+  // term).
+  evmc_message NewMsg{
+      .kind = EVMC_CALL,
+      .flags = Frame->Msg.flags,
+      .depth = Frame->Msg.depth + 1,
+      .gas = static_cast<int64_t>(CallGas),
+      .recipient = Dest,
+      .sender = Frame->Authorized,
+      .input_data = Frame->Memory.data() + InputOffset64,
+      .input_size = InputSize64,
+      .value = intx::be::store<evmc::bytes32>(Value),
+      .create2_salt = {},
+      .code_address = Dest,
+      .code = nullptr,
+      .code_size = 0,
+  };
+  NewMsg.flags &= ~uint32_t(EVMC_DELEGATED);
+
+  const auto Result = Frame->Host->call(NewMsg);
+  Context->setResource();
+  if (Result.status_code == EVMC_SUCCESS) {
+    Frame->pop(); // pop the assume value
+    Frame->push(intx::uint256(1));
+  }
+  Context->setReturnData(std::vector<uint8_t>(
+      Result.output_data, Result.output_data + Result.output_size));
+
+  const auto CopySize =
+      std::min(static_cast<size_t>(OutputSize64), Result.output_size);
+  if (CopySize > 0) {
+    std::memcpy(Frame->Memory.data() + OutputOffset64, Result.output_data,
+                CopySize);
+  }
+
+  CallGas = NewMsg.gas > 0 ? static_cast<uint64_t>(NewMsg.gas) : 0;
+  uint64_t GasLeftAfter =
+      Result.gas_left > 0 ? static_cast<uint64_t>(Result.gas_left) : 0;
+  uint64_t GasUsed = CallGas > GasLeftAfter ? CallGas - GasLeftAfter : 0;
+  if (GasUsed > 0 && !chargeGas(Frame, GasUsed)) {
+    Context->setStatus(EVMC_OUT_OF_GAS);
+    return;
+  }
+
+  // Track subcall refund at Instance level (may be negative).
+  Context->getInstance()->addGasRefund(Result.gas_refund);
+  // AUTHCALL does not reset the authorized address (only AUTH does).
   Context->setStatus(EVMC_SUCCESS);
 }
 

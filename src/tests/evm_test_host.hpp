@@ -6,6 +6,7 @@
 #include "evm/interpreter.h"
 #include "evm_precompiles.hpp"
 #include "evmc/mocked_host.hpp"
+#include "host/evm/account_nonce.h"
 #include "host/evm/crypto.h"
 #include "runtime/evm_instance.h"
 #include "runtime/evm_memory_specialization.h"
@@ -146,7 +147,26 @@ public:
     return Revision >= EVMC_LONDON ? GasUsed / 5 : GasUsed / 2;
   }
 
-  ZenMockedEVMHost() = default;
+  ZenMockedEVMHost() {
+    // EIP-3074 AUTH needs the signer's (authority's) current account nonce,
+    // which evmc::Host does not expose.  Register this host as a nonce
+    // provider so the interpreter can read `accounts[].nonce`.
+    zen::host::evm::registerAccountNonceProvider(
+        this, {+[](const evmc::address &Addr, void *Ctx) -> uint64_t {
+                 return static_cast<const ZenMockedEVMHost *>(Ctx)
+                     ->lookupAccountNonce(Addr);
+               },
+               this});
+  }
+
+  ~ZenMockedEVMHost() override {
+    zen::host::evm::unregisterAccountNonceProvider(this);
+  }
+
+  uint64_t lookupAccountNonce(const evmc::address &Addr) const {
+    const auto It = accounts.find(Addr);
+    return It == accounts.end() ? 0 : It->second.nonce;
+  }
 
   void setRuntime(Runtime *NewRT) {
     if (RT != NewRT) {

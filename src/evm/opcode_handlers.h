@@ -315,6 +315,10 @@ DEFINE_UNIMPLEMENT_HANDLER(Keccak256);
 // Self-destruct operation
 DEFINE_UNIMPLEMENT_HANDLER(SelfDestruct);
 
+// EIP-3074 (protocol extension): account authorization opcodes
+DEFINE_UNIMPLEMENT_HANDLER(Auth);
+DEFINE_UNIMPLEMENT_HANDLER(AuthCall);
+
 } // namespace zen::evm
 
 #endif // ZEN_EVM_OPCODE_HANDLERS_H

@@ -311,6 +311,9 @@ EVMFrame *InterpreterExecContext::allocTopFrame(evmc_message *Msg) {
     clearFrameTransientBuffers(Frame);
     Frame.MTx = {};
     Frame.Value = 0;
+    // EIP-3074: authorization does not survive across frames.
+    Frame.HasAuthorized = false;
+    Frame.Authorized = {};
   }
   ++FrameCount;
 
@@ -509,6 +512,8 @@ void BaseInterpreter::interpret() {
           base[0xf3] = &&TARGET_RETURN;
           base[0xf4] = &&TARGET_CALLX;
           base[0xf5] = &&TARGET_CREATEX;
+          base[0xf6] = &&TARGET_AUTH;
+          base[0xf7] = &&TARGET_AUTHCALL;
           base[0xfa] = &&TARGET_CALLX;
           base[0xfd] = &&TARGET_REVERT;
           base[0xfe] = &&TARGET_INVALID;
@@ -946,6 +951,12 @@ void BaseInterpreter::interpret() {
         DISPATCH_NEXT;
       }
 
+      // EIP-3074 single-opcode handlers (Osaka-gated via the names table)
+      TARGET_AUTH:
+        HANDLER_CALL(AuthHandler::doExecute());
+      TARGET_AUTHCALL:
+        HANDLER_CALL(AuthCallHandler::doExecute());
+
       // ---- Special termination handlers (may change Frame) ----
       TARGET_RETURN : {
         Frame->Sp = sp;
@@ -1162,6 +1173,14 @@ void BaseInterpreter::interpret() {
 
         case evmc_opcode::OP_KECCAK256:
           Keccak256Handler::doExecute();
+          break;
+
+        // EIP-3074 (protocol extension, Osaka-gated by the names table)
+        case evmc_opcode::OP_AUTH:
+          AuthHandler::doExecute();
+          break;
+        case evmc_opcode::OP_AUTHCALL:
+          AuthCallHandler::doExecute();
           break;
 
         case evmc_opcode::OP_ADDRESS:
@@ -1885,6 +1904,16 @@ void BaseInterpreter::interpret() {
     case evmc_opcode::OP_PUSH0: { // PUSH0 (EIP-3855)
       executePush0Opcode(Frame, Context, MetricsTable,
                          static_cast<uint8_t>(OpcodeByte));
+      break;
+    }
+
+    // EIP-3074 (protocol extension, Osaka-gated by the names table)
+    case evmc_opcode::OP_AUTH: {
+      AuthHandler::execute();
+      break;
+    }
+    case evmc_opcode::OP_AUTHCALL: {
+      AuthCallHandler::execute();
       break;
     }
 
