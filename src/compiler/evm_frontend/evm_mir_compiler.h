@@ -340,6 +340,12 @@ public:
   // Complete jump implementation with jump table
   void createJumpTable();
   void implementConstantJump(uint64_t ConstDest, MBasicBlock *FailureBB);
+  // RJUMP (EIP-4200): unconditional static branch.  `ConstDest` may point at
+  // any in-bounds instruction (JUMPDEST not required); createJumpTable()
+  // pre-registers a body for it, so this resolves like a constant JUMP and
+  // branches to the BAD_JUMP_DESTINATION failure block when the destination
+  // was not registered (out-of-bounds or truncated at load time).
+  void handleRJump(uint64_t ConstDest);
   void
   implementIndirectJump(MInstruction *JumpTarget, MBasicBlock *FailureBB,
                         const JumpTargetPCList *CandidateTargets = nullptr);

@@ -676,6 +676,9 @@ private:
       case OP_JUMP:
         popN(Stack, 1);
         return;
+      case static_cast<evmc_opcode>(0xe0): // RJUMP (EIP-4200)
+        // Unconditional static jump, no stack operands, block terminates.
+        return;
       case OP_JUMPI:
         popN(Stack, 2);
         return;

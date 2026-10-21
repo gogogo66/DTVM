@@ -1617,6 +1617,33 @@ void EVMMirBuilder::createJumpTable() {
         uint8_t PushSize = static_cast<uint8_t>(Bytecode[PC]) + 1 -
                            static_cast<uint8_t>(evmc_opcode::OP_PUSH1);
         PC += PushSize; // Skip the immediate data
+      } else if (Bytecode[PC] == static_cast<Byte>(0xe0)) {
+        // RJUMP (EIP-4200): register the statically-decoded destination as an
+        // implicit jump-dest body even though the byte there is not a
+        // JUMPDEST (EIP-4200 allows any instruction as the target).  Skipping
+        // the 2-byte immediate also stops a 0x5b byte inside it from being
+        // mis-scanned as a JUMPDEST below.
+        // Mirrors the interpreter's resolveRJumpDestination() bounds checks:
+        // truncated immediate or out-of-bounds destination means the runtime
+        // traps with BAD_JUMP_DESTINATION (unregistered lookup).
+        bool HasValidDest = false;
+        size_t DestPC = 0;
+        if (PC + 2 < BytecodeSize) {
+          const int32_t Imm = static_cast<int32_t>(static_cast<int16_t>(
+              (static_cast<uint16_t>(Bytecode[PC + 1]) << 8) |
+              Bytecode[PC + 2]));
+          const int64_t Dest = static_cast<int64_t>(PC) + 3 + Imm;
+          HasValidDest =
+              Dest >= 0 && static_cast<uint64_t>(Dest) < BytecodeSize;
+          DestPC = HasValidDest ? static_cast<size_t>(Dest) : 0;
+        }
+        if (HasValidDest && JumpDestTable.find(DestPC) == JumpDestTable.end()) {
+          MBasicBlock *BodyBB = createBasicBlock();
+          BodyBB->setJumpDestBB(true);
+          JumpDestBodyTable[DestPC] = BodyBB;
+          JumpDestTable[DestPC] = BodyBB;
+        }
+        PC += 2; // Skip the immediate data
       }
     }
   }
@@ -1651,6 +1678,12 @@ void EVMMirBuilder::implementConstantJump(uint64_t ConstDest,
     createInstruction<BrInstruction>(true, Ctx, FailureBB);
     addSuccessor(FailureBB);
   }
+}
+
+void EVMMirBuilder::handleRJump(uint64_t ConstDest) {
+  MBasicBlock *InvalidJumpBB =
+      getOrCreateExceptionSetBB(ErrorCode::EVMBadJumpDestination);
+  implementConstantJump(ConstDest, InvalidJumpBB);
 }
 
 void EVMMirBuilder::implementIndirectJump(

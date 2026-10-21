@@ -323,16 +323,27 @@ private:
 
         Ip++;
 
-        bool IsDeadInstruction = InDeadCode && Opcode != OP_JUMPDEST;
+        bool IsJumpDest = (Opcode == OP_JUMPDEST);
+        // A static RJUMP (EIP-4200) destination is an implicit block entry
+        // even if the byte there is not a JUMPDEST: the analyzer opened a
+        // BlockInfo at this PC, so the linear walk must begin it (and its
+        // dead-code skip must not swallow the target instruction).
+        const bool IsRJumpTargetBlock =
+            !IsJumpDest && Analyzer.isRJumpTargetBlockEntry(PC) &&
+            (InDeadCode || CurrentBlockEntryPC != PC);
+
+        bool IsDeadInstruction =
+            InDeadCode && !IsJumpDest && !IsRJumpTargetBlock;
         if (IsDeadInstruction) {
           if (Opcode >= OP_PUSH0 && Opcode <= OP_PUSH32) {
             uint8_t NumBytes =
                 static_cast<uint8_t>(Opcode) - static_cast<uint8_t>(OP_PUSH0);
             Ip += NumBytes;
+          } else if (static_cast<uint8_t>(Opcode) == 0xe0) {
+            Ip += 2; // skip the RJUMP displacement
           }
           continue;
         }
-        bool IsJumpDest = (Opcode == OP_JUMPDEST);
         if (!IsJumpDest) {
           if (!Builder.isOpcodeDefined(Opcode)) {
 #ifdef ZEN_ENABLE_JIT_FALLBACK_TEST
@@ -352,6 +363,26 @@ private:
             Builder.handleUndefined();
             PC++;
             continue;
+          }
+          if (IsRJumpTargetBlock) {
+            // Open the implicit RJUMP-target block.  Mirrors the JUMPDEST
+            // begin (lifted/runtime entry-state handoff) without the
+            // consecutive-JUMPDEST run merging; the target instruction's own
+            // gas is metered by the generic meterOpcode below.
+            const bool HasLiveFallthrough = !InDeadCode;
+            if (HasLiveFallthrough && CurrentBlockLifted &&
+                isLiftedBlock(PC)) {
+              auto OutgoingStack = drainLogicalStack();
+              assignLiftedEntryState(PC, OutgoingStack);
+              finalizeBlockExit(std::move(OutgoingStack), false);
+            } else {
+              handleEndBlock();
+              if (HasLiveFallthrough && isLiftedBlock(PC)) {
+                assignLiftedEntryStateFromRuntime(Analyzer, PC);
+              }
+            }
+            Builder.handleJumpDest(PC, HasLiveFallthrough);
+            handleBeginBlock(Analyzer);
           }
           if (tryHandleControlFlowMacroOp(Analyzer, Bytecode, BytecodeSize,
                                           Opcode, Ip)) {
@@ -867,6 +898,45 @@ private:
           break;
         }
 
+        // RJUMP (EIP-4200, 0xe0): static unconditional jump.  No stack
+        // operands; destination = PC + 3 + signExtend(imm16be).  The target
+        // does not need to be a JUMPDEST.
+        case static_cast<evmc_opcode>(0xe0): {
+          uint64_t Dest = 0;
+          bool Valid = false;
+          if (PC + 2 < BytecodeSize) {
+            const int32_t Imm = static_cast<int32_t>(static_cast<int16_t>(
+                (static_cast<uint16_t>(Bytecode[PC + 1]) << 8) |
+                Bytecode[PC + 2]));
+            const int64_t RawDest = static_cast<int64_t>(PC) + 3 + Imm;
+            Valid = RawDest >= 0 &&
+                    static_cast<uint64_t>(RawDest) < BytecodeSize;
+            Dest = Valid ? static_cast<uint64_t>(RawDest) : BytecodeSize;
+          } else {
+            Dest = BytecodeSize;
+          }
+          if (Valid && CurrentBlockLifted && isLiftedBlock(Dest)) {
+            auto OutgoingStack = drainLogicalStack();
+            assignLiftedEntryState(Dest, OutgoingStack);
+            finalizeBlockExit(std::move(OutgoingStack), false);
+          } else {
+            handleEndBlock();
+            if (Valid && isLiftedBlock(Dest)) {
+              assignLiftedEntryStateFromRuntime(Analyzer, Dest);
+            }
+          }
+          // Direct static branch.  In-bounds RJUMP destinations were
+          // pre-registered by createJumpTable() (JumpDestTable), so the
+          // branch lands on the target block; an unregistered (out-of-bounds
+          // or truncated) destination branches to the failure block and
+          // raises BAD_JUMP_DESTINATION, matching the interpreter.  The
+          // invalid sentinel (BytecodeSize) can never be an in-bounds dest,
+          // so it is guaranteed unregistered.
+          Builder.handleRJump(Dest);
+          Ip += 2;
+          break;
+        }
+
         case OP_JUMPDEST: {
           // Consecutive JUMPDEST opcodes share one body BB in multipass.
           // Charge all skipped metering points before jumping to the shared
@@ -1370,7 +1440,8 @@ private:
   static bool isBlockTerminatorOpcode(evmc_opcode Opcode) {
     return Opcode == OP_JUMP || Opcode == OP_JUMPI || Opcode == OP_RETURN ||
            Opcode == OP_STOP || Opcode == OP_INVALID || Opcode == OP_REVERT ||
-           Opcode == OP_SELFDESTRUCT;
+           Opcode == OP_SELFDESTRUCT ||
+           Opcode == static_cast<evmc_opcode>(0xe0); // RJUMP (EIP-4200)
   }
 
   static AbstractConstU64 makeUnknownConstU64() { return {}; }

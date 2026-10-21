@@ -60,7 +60,30 @@ static uint8_t opcodeLen(uint8_t OpcodeU8) {
     return static_cast<uint8_t>(
         OpcodeU8 - static_cast<uint8_t>(evmc_opcode::OP_PUSH1) + 2);
   }
+  // RJUMP (EIP-4200): opcode + 2-byte signed big-endian displacement.
+  if (OpcodeU8 == static_cast<uint8_t>(0xe0)) {
+    return 3;
+  }
   return 1;
+}
+
+// Sign-extends the 16-bit big-endian RJUMP displacement and returns the jump
+// destination (PC after the immediate) or false when the immediate is
+// truncated or the destination falls outside [0, CodeSize).
+static bool decodeRJumpTarget(const zen::common::Byte *Code, size_t CodeSize,
+                              size_t Pc, uint32_t &DestPc) {
+  if (Pc + 2 >= CodeSize) {
+    return false;
+  }
+  const int32_t Imm = static_cast<int32_t>(static_cast<int16_t>(
+      (static_cast<uint16_t>(static_cast<uint8_t>(Code[Pc + 1])) << 8) |
+      static_cast<uint16_t>(static_cast<uint8_t>(Code[Pc + 2]))));
+  const int64_t Dest = static_cast<int64_t>(Pc) + 3 + Imm;
+  if (Dest < 0 || static_cast<uint64_t>(Dest) >= CodeSize) {
+    return false;
+  }
+  DestPc = static_cast<uint32_t>(Dest);
+  return true;
 }
 
 static bool isGasChunkTerminator(uint8_t OpcodeU8) {
@@ -72,6 +95,7 @@ static bool isGasChunkTerminator(uint8_t OpcodeU8) {
   case evmc_opcode::OP_INVALID:
   case evmc_opcode::OP_JUMP:
   case evmc_opcode::OP_JUMPI:
+  case static_cast<evmc_opcode>(0xe0): // RJUMP (EIP-4200): unconditional, no fallthrough
   case evmc_opcode::OP_GAS:
   case evmc_opcode::OP_SSTORE:
   case evmc_opcode::OP_CREATE:
@@ -94,6 +118,7 @@ static bool isControlFlowTerminator(uint8_t OpcodeU8) {
   case evmc_opcode::OP_SELFDESTRUCT:
   case evmc_opcode::OP_INVALID:
   case evmc_opcode::OP_JUMP:
+  case static_cast<evmc_opcode>(0xe0): // RJUMP (EIP-4200)
     return true;
   default:
     return false;
@@ -214,6 +239,11 @@ buildJumpDestMapAndPushCache(const zen::common::Byte *Code, size_t CodeSize,
           CurOpcodeU8 - static_cast<uint8_t>(evmc_opcode::OP_PUSH1) + 1;
       PushValueMap[Pc] = loadPushValue(Code, CodeSize, Pc, NumBytes);
       Pc += NumBytes;
+    } else if (CurOpcodeU8 == static_cast<uint8_t>(0xe0)) {
+      // RJUMP (EIP-4200): its 2-byte displacement is immediate data, not
+      // opcodes.  Skip it so a 0x5b byte inside the displacement is not
+      // wrongly marked as a valid JUMPDEST.
+      Pc += 2;
     }
   }
 }
@@ -566,6 +596,21 @@ buildCFGEdges(std::vector<GasBlock> &Blocks, EdgeTables &Edges,
       }
       // Dynamic jump: handled by the implicit-predecessor count stamped onto
       // every JUMPDEST below. No explicit Succs/Preds edges added.
+    } else if (Block.LastOpcode == static_cast<uint8_t>(0xe0)) {
+      // RJUMP (EIP-4200): the destination is statically encoded, resolved in
+      // advance and recorded in ResolvedJumpTargets by the abstract-stack
+      // pass.  Unlike JUMP it does not need a JUMPDEST; if the resolver could
+      // not produce an in-bounds destination (truncated immediate or
+      // out-of-bounds target at load time), no edge is added and the source
+      // block is treated as terminating at runtime with
+      // BAD_JUMP_DESTINATION — safe for SPP since it never shifts across it.
+      auto It = ResolvedJumpTargets.find(Block.LastPc);
+      if (It != ResolvedJumpTargets.end()) {
+        const uint32_t SuccId = BlockAtPc[It->second];
+        if (SuccId != UINT32_MAX) {
+          addEdge(Edges, static_cast<uint32_t>(BlockId), SuccId);
+        }
+      }
     }
   }
 
@@ -1342,6 +1387,7 @@ static size_t pushImmediateSize(uint8_t OpcodeU8) {
 static bool isBlockTerminatorForJumpResolution(uint8_t OpcodeU8) {
   switch (static_cast<evmc_opcode>(OpcodeU8)) {
   case evmc_opcode::OP_JUMP:
+  case static_cast<evmc_opcode>(0xe0): // RJUMP (EIP-4200)
   case evmc_opcode::OP_STOP:
   case evmc_opcode::OP_RETURN:
   case evmc_opcode::OP_INVALID:
@@ -1416,6 +1462,24 @@ static void resolveJumpTargetsByAbstractStack(
           ResolvedTargets[JumpPC] = static_cast<uint32_t>(Dest.Low);
         }
         // Skip dead code until next JUMPDEST or end.
+        while (ScanPC < CodeSize &&
+               static_cast<uint8_t>(Code[ScanPC]) !=
+                   static_cast<uint8_t>(evmc_opcode::OP_JUMPDEST)) {
+          ScanPC += opcodeLen(static_cast<uint8_t>(Code[ScanPC]));
+        }
+        break;
+      }
+
+      if (Op == static_cast<uint8_t>(0xe0)) {
+        // RJUMP (EIP-4200): destination is statically encoded in the 16-bit
+        // signed big-endian displacement.  The target does NOT need to be a
+        // JUMPDEST (unlike JUMP), so record the raw destination.  Skip the 2
+        // immediate bytes, then dead code until the next JUMPDEST.
+        uint32_t DestPc = 0;
+        if (decodeRJumpTarget(Code, CodeSize, ScanPC - 1, DestPc)) {
+          ResolvedTargets[static_cast<uint32_t>(ScanPC - 1)] = DestPc;
+        }
+        ScanPC += 2; // skip the displacement
         while (ScanPC < CodeSize &&
                static_cast<uint8_t>(Code[ScanPC]) !=
                    static_cast<uint8_t>(evmc_opcode::OP_JUMPDEST)) {

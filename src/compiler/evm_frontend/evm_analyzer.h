@@ -497,12 +497,43 @@ public:
 
   bool hasUnknownDynamicJumpTargets() const { return HasUnknownDynamicJump; }
 
-  bool shouldBuildMemoryFacts() const {
-#ifdef ZEN_ENABLE_EVM_MEMORY_PLAN_FRAMEWORK
-    return JITResult.ShouldBuildMemoryFacts;
-#else
-    return true;
-#endif
+  // True when `PC` is a static RJUMP (EIP-4200) destination that opens a new
+  // block even though the byte there is not a JUMPDEST.  The JIT block model
+  // is JUMPDEST-centric, so implicit entries are tracked separately.
+  bool isRJumpTargetBlockEntry(uint64_t PC) const {
+    return RJumpTargetPCs.count(PC) != 0;
+  }
+
+  // Walks the bytecode (opcode lengths respected) and records every valid
+  // RJUMP destination PC.  Called from analyze() before block building; the
+  // sets below make RJUMP targets behave like implicit block boundaries.
+  void collectRJumpTargetPCs(const uint8_t *Bytecode, size_t BytecodeSize) {
+    RJumpTargetPCs.clear();
+    // RJUMP only exists from EVMC_EXPERIMENTAL (fork's osaka names row).  At
+    // older revisions the byte is undefined and the JIT treats it as such, so
+    // do not mint implicit block entries for a dead opcode.
+    if (InstructionNames == nullptr ||
+        InstructionNames[static_cast<uint8_t>(0xe0)] == nullptr) {
+      return;
+    }
+    size_t PC = 0;
+    while (PC < BytecodeSize) {
+      const uint8_t OpcodeU8 = Bytecode[PC];
+      if (OpcodeU8 == static_cast<uint8_t>(0xe0)) {
+        uint64_t Dest = 0;
+        if (decodeRJumpDestination(Bytecode, BytecodeSize, PC, Dest)) {
+          RJumpTargetPCs.insert(Dest);
+        }
+        PC += 3; // opcode + 2-byte immediate
+        continue;
+      }
+      if (OpcodeU8 >= static_cast<uint8_t>(OP_PUSH0) &&
+          OpcodeU8 <= static_cast<uint8_t>(OP_PUSH32)) {
+        PC += 1 + (OpcodeU8 - static_cast<uint8_t>(OP_PUSH0));
+        continue;
+      }
+      ++PC;
+    }
   }
 
   bool analyzeSuitabilityOnly(const uint8_t *Bytecode, size_t BytecodeSize) {
@@ -511,8 +542,17 @@ public:
     return true;
   }
 
+  bool shouldBuildMemoryFacts() const {
+#ifdef ZEN_ENABLE_EVM_MEMORY_PLAN_FRAMEWORK
+    return JITResult.ShouldBuildMemoryFacts;
+#else
+    return true;
+#endif
+  }
+
   bool analyze(const uint8_t *Bytecode, size_t BytecodeSize) {
     resetAnalysisState();
+    collectRJumpTargetPCs(Bytecode, BytecodeSize);
     analyzeSuitability(Bytecode, BytecodeSize);
     buildJumpDestRuns(Bytecode, BytecodeSize);
     buildBlocks(Bytecode, BytecodeSize);
@@ -650,6 +690,7 @@ private:
     BlockInfos.clear();
     DynamicJumpRegions.clear();
     JumpDestCanonicalPCs.clear();
+    RJumpTargetPCs.clear();
     EntryBlockPC = 0;
     HasUnknownDynamicJump = false;
 #ifdef ZEN_ENABLE_EVM_MEMORY_PLAN_FRAMEWORK
@@ -705,6 +746,7 @@ private:
   static bool isBlockTerminator(evmc_opcode Opcode) {
     switch (Opcode) {
     case OP_JUMP:
+    case static_cast<evmc_opcode>(0xe0): // RJUMP (EIP-4200)
     case OP_STOP:
     case OP_RETURN:
     case OP_INVALID:
@@ -720,7 +762,30 @@ private:
     if (Opcode >= OP_PUSH0 && Opcode <= OP_PUSH32) {
       return static_cast<size_t>(Opcode - OP_PUSH0);
     }
+    if (Opcode == static_cast<evmc_opcode>(0xe0)) { // RJUMP (EIP-4200)
+      return 2;
+    }
     return 0;
+  }
+
+  // Decodes the signed 16-bit big-endian RJUMP displacement at `Pc` (which must
+  // point at the opcode byte) and returns the destination PC (address after the
+  // immediate plus the sign-extended offset), or false when the immediate is
+  // truncated or the destination falls outside [0, BytecodeSize).
+  static bool decodeRJumpDestination(const uint8_t *Bytecode,
+                                     size_t BytecodeSize, size_t Pc,
+                                     uint64_t &OutDest) {
+    if (Pc + 2 >= BytecodeSize) {
+      return false;
+    }
+    const int32_t Imm = static_cast<int32_t>(static_cast<int16_t>(
+        (static_cast<uint16_t>(Bytecode[Pc + 1]) << 8) | Bytecode[Pc + 2]));
+    const int64_t Dest = static_cast<int64_t>(Pc) + 3 + Imm;
+    if (Dest < 0 || static_cast<uint64_t>(Dest) >= BytecodeSize) {
+      return false;
+    }
+    OutDest = static_cast<uint64_t>(Dest);
+    return true;
   }
 
 #ifdef ZEN_ENABLE_EVM_MEMORY_PLAN_FRAMEWORK
@@ -929,6 +994,22 @@ private:
         break;
       }
 
+      // A PC that is a static RJUMP (EIP-4200) destination opens a new block
+      // even though the byte there is not a JUMPDEST.  Split mid-block so both
+      // the linear predecessor and the raised branch land on a true block
+      // (keeps StackLifter / entry-depth / lifting consistent).  Unlike
+      // JUMPDEST, no opcode byte is consumed: the target instruction is the
+      // first body instruction.
+      if (RJumpTargetPCs.count(static_cast<uint64_t>(ScanPC)) != 0 &&
+          static_cast<uint64_t>(ScanPC) != Info.BodyStartPC) {
+        Info.Successors.push_back(static_cast<uint64_t>(ScanPC));
+        NextEntryPC = static_cast<uint64_t>(ScanPC);
+        NextBodyStartPC = ScanPC;
+        HasNextBlock = true;
+        Info.BodyEndPC = static_cast<uint64_t>(ScanPC);
+        break;
+      }
+
       bool IsUndefined = (InstructionNames[Opcode] == nullptr);
       if (IsUndefined) {
         Info.HasUndefinedInstr = true;
@@ -981,6 +1062,28 @@ private:
         if (Info.HasDynamicJump && HasNextBlock) {
           Info.DynamicJumpTargetRegionEntryPC = NextEntryPC;
         }
+        break;
+      }
+
+      if (Opcode == static_cast<evmc_opcode>(0xe0)) {
+        // RJUMP (EIP-4200): unconditional static jump.  The destination is
+        // encoded in the 16-bit signed big-endian immediate and does NOT need
+        // to be a JUMPDEST.  No stack operands.
+        uint64_t Dest = 0;
+        if (decodeRJumpDestination(Bytecode, BytecodeSize, ScanPC - 1,
+                                   Dest)) {
+          Info.HasConstantJump = true;
+          Info.ConstantJumpTargetPC = Dest;
+          Info.Successors.push_back(Dest);
+        }
+        // The 2 immediate bytes are data, not opcodes; the block body ends
+        // after them.
+        Info.BodyEndPC = static_cast<uint64_t>(ScanPC) + 2;
+        ScanPC += 2;
+        // Code after the jump is dead unless another edge targets it; the
+        // linear walk resumes at the next JUMPDEST or implicit RJUMP target.
+        skipDeadCode(Bytecode, BytecodeSize, ScanPC, NextEntryPC,
+                     NextBodyStartPC, HasNextBlock);
         break;
       }
 
@@ -1097,6 +1200,15 @@ private:
             getCanonicalJumpDestPC(static_cast<uint64_t>(ScanPC));
         NextEntryPC = CanonicalPC;
         NextBodyStartPC = static_cast<size_t>(CanonicalPC) + 1;
+        HasNextBlock = true;
+        return;
+      }
+      // An in-bounds RJUMP destination is an implicit block entry even when it
+      // is not a JUMPDEST: execution can resume there, so the linear walk must
+      // open a block at that PC rather than skipping over it as dead code.
+      if (RJumpTargetPCs.count(static_cast<uint64_t>(ScanPC)) != 0) {
+        NextEntryPC = static_cast<uint64_t>(ScanPC);
+        NextBodyStartPC = ScanPC;
         HasNextBlock = true;
         return;
       }
@@ -1720,6 +1832,15 @@ private:
       if (Info.IsDynamicJumpTargetCandidate) {
         Info.CanLiftStack = false;
       }
+      // A non-JUMPDEST RJUMP (EIP-4200) destination is entered from a static
+      // branch whose entry-state handoff follows the runtime-stack convention
+      // (no canonical jumpdest shape / no SSA successor assignment), so
+      // lifting such an entry block would desynchronize its entry phis.
+      // JUMPDEST targets are unaffected (they go through the canonical path).
+      if (Info.CanLiftStack && !Info.IsJumpDest &&
+          RJumpTargetPCs.count(EntryPC) != 0) {
+        Info.CanLiftStack = false;
+      }
       // Never lift a block any of whose static predecessors has an unresolved
       // exit depth. Such an edge's runtime-entry assignment is silently skipped
       // (canAssignLiftedEntryStateFromRuntime bails when ResolvedExitStackDepth
@@ -2305,6 +2426,9 @@ private:
       case OP_JUMP:
         popStackRanges(Stack, 1);
         return;
+      case static_cast<evmc_opcode>(0xe0): // RJUMP (EIP-4200)
+        // Unconditional static jump; no stack operands; block terminates.
+        return;
       case OP_JUMPI:
         popStackRanges(Stack, 2);
         // Fallthrough block continues; exit state is current Stack.
@@ -2464,6 +2588,11 @@ private:
   // assignment in finalizeDynamicJumpRegionMetadata for O(1) lookup.
   std::unordered_map<uint32_t, int32_t> ShapeClassEntryDepths;
   std::map<uint64_t, uint64_t> JumpDestCanonicalPCs;
+  // PCs of in-bounds RJUMP (EIP-4200) destinations.  The JIT block model is
+  // JUMPDEST-centric, but RJUMP may target any instruction; these PCs
+  // therefore become implicit block entries so the raised branch lands on a
+  // true block (StackLifter/entry-depth/lifting see the edge).
+  std::unordered_set<uint64_t> RJumpTargetPCs;
   uint64_t EntryBlockPC = 0;
   bool HasUnknownDynamicJump = false;
   evmc_revision Revision = zen::evm::DEFAULT_REVISION;
