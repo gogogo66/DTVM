@@ -1,0 +1,10 @@
+// RJUMP +5 (PC = 0 + 3 + 5 = 8) skips PUSH1 0x2A / PUSH1 0x00 / MSTORE (PC3-PC7)
+// and lands on PUSH1 0x20; the skipped MSTORE leaves memory empty, so RETURN
+// yields 32 zero bytes.
+HEX e00005
+PUSH1 0x2A
+PUSH1 0x00
+MSTORE
+PUSH1 0x20
+PUSH1 0x00
+RETURN

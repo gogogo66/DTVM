@@ -1,0 +1,3 @@
+// Far forward displacement: target PC = 0 + 3 + 0x0100 = 259, far beyond code end.
+HEX e00100
+STOP
