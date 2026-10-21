@@ -13,6 +13,7 @@
 #include "evm/evm.h"
 #include "evm/interpreter.h"
 #include "evm_test_host.hpp"
+#include "compiler/evm_frontend/evm_analyzer.h"
 #include "runtime/evm_module.h"
 #include "utils/evm.h"
 #include "zetaengine.h"
@@ -3754,9 +3755,13 @@ std::string AddrHex(const evmc::address &A) {
 }
 
 std::string ToUint256Hex(uint64_t V) {
+  // 32-byte big-endian hex (64 chars), matching zen::utils::toHex output for
+  // a 32-byte word: value occupies the least-significant 8 bytes.  Only the
+  // low 8 bytes (16 hex chars) are written; shifting uint64_t by >= 64 bits
+  // is UB (the x86 shift-count mask would ghost-copy the value upwards).
   std::string Hex(64, '0');
   static const char *kDigits = "0123456789ABCDEF";
-  for (int I = 0; I < 16; ++I) {
+  for (int I = 0; I < 8; ++I) {
     Hex[62 - 2 * I] = kDigits[(V >> (8 * I + 4)) & 0xF];
     Hex[63 - 2 * I] = kDigits[(V >> (8 * I)) & 0xF];
   }
@@ -4475,7 +4480,7 @@ TEST(EVMAuthCall, AutcallReturnDataMatchesCallSemantics) {
   // RETURNDATACOPY(stack: destOffset, offset, size); push size first so that
   // destOffset ends up on top of the stack.
   const std::string Tail =
-      "50" +  // POP AUTHCALL success flag
+      std::string("50") +  // POP AUTHCALL success flag
       "6020" +  // PUSH1 32 size
       "5f" +  // PUSH0 offset
       "5f" +  // PUSH0 destOffset
@@ -4498,4 +4503,61 @@ TEST(EVMAuthCall, AutcallReturnDataMatchesCallSemantics) {
   ASSERT_EQ(Result.Status, EVMC_SUCCESS);
   EXPECT_EQ(Result.OutputHex, Payload)
       << "AUTHCALL must expose child return data via RETURNDATACOPY";
+}
+
+// ============================================================================
+// JIT suitability gates for AUTH/AUTHCALL (fallback-only degradation contract).
+// The EVM JIT frontend has no MIR lowering for these protocol-extension
+// opcodes, so EVMAnalyzer must mark modules containing them (when defined at
+// the module's revision) as interpreter-fallback.  These tests pin the OSAKA /
+// pre-Osaka / PUSH-immediate behavior of analyzeSuitabilityOnly.
+// ============================================================================
+
+TEST(EIP3074Auth, JitSuitabilityForcesFallbackForAuthAtOsaka) {
+  // PUSH1 0x00 (three operands) AUTH STOP: AUTH consumes 3, produces 1.
+  const std::vector<uint8_t> Code =
+      authFromHex("600060006000f600");
+  COMPILER::EVMAnalyzer Analyzer(EVMC_OSAKA);
+  Analyzer.analyzeSuitabilityOnly(Code.data(), Code.size());
+  const auto &Suit = Analyzer.getJITSuitability();
+  EXPECT_TRUE(Suit.ShouldFallback)
+      << "OSAKA module containing defined AUTH must fall back to the "
+         "interpreter (no JIT lowering)";
+  EXPECT_EQ(Suit.AuthOpcodeCount, 1U);
+}
+
+TEST(EIP3074Auth, JitSuitabilityForcesFallbackForAuthCallAtOsaka) {
+  const std::vector<uint8_t> Code =
+      authFromHex("6000600060006000600060006000f700");
+  COMPILER::EVMAnalyzer Analyzer(EVMC_OSAKA);
+  Analyzer.analyzeSuitabilityOnly(Code.data(), Code.size());
+  const auto &Suit = Analyzer.getJITSuitability();
+  EXPECT_TRUE(Suit.ShouldFallback)
+      << "OSAKA module containing defined AUTHCALL must fall back to the "
+         "interpreter (no JIT lowering)";
+  EXPECT_EQ(Suit.AuthOpcodeCount, 1U);
+}
+
+TEST(EIP3074Auth, JitSuitabilityDoesNotForceFallbackPreOsaka) {
+  // At PRAGUE the 0xf6 byte is an undefined instruction.  Both engines agree
+  // on EVMC_UNDEFINED_INSTRUCTION, so no fallback is forced; the opcode count
+  // is still tracked for diagnostics.
+  const std::vector<uint8_t> Code = authFromHex("f600");
+  COMPILER::EVMAnalyzer Analyzer(EVMC_PRAGUE);
+  Analyzer.analyzeSuitabilityOnly(Code.data(), Code.size());
+  const auto &Suit = Analyzer.getJITSuitability();
+  EXPECT_FALSE(Suit.ShouldFallback)
+      << "Pre-Osaka undefined 0xf6 must not force interpreter fallback";
+  EXPECT_EQ(Suit.AuthOpcodeCount, 1U);
+}
+
+TEST(EIP3074Auth, JitSuitabilityIgnoresAuthBytesInsidePushImmediates) {
+  // 0xf6/0xf7 as PUSH2 immediate data must not be misread as opcodes.
+  const std::vector<uint8_t> Code = authFromHex("61f6f700");
+  COMPILER::EVMAnalyzer Analyzer(EVMC_OSAKA);
+  Analyzer.analyzeSuitabilityOnly(Code.data(), Code.size());
+  const auto &Suit = Analyzer.getJITSuitability();
+  EXPECT_EQ(Suit.AuthOpcodeCount, 0U);
+  EXPECT_FALSE(Suit.ShouldFallback)
+      << "AUTH bytes inside PUSH immediates must not trigger fallback";
 }

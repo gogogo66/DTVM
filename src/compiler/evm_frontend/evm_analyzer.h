@@ -118,6 +118,14 @@ struct JITSuitabilityResult {
   size_t MaxConsecutiveExpensive = 0; // longest unbroken run
   size_t MaxBlockExpensiveCount = 0;  // max RA-expensive ops in one block
   size_t DupFeedbackPatternCount = 0; // DUPn immediately before RA-expensive
+  // EIP-3074 AUTH(0xf6)/AUTHCALL(0xf7) opcode occurrences. The JIT frontend
+  // has no MIR lowering for these protocol-extension opcodes, so any module
+  // containing them (when defined at the module's revision) is forced to the
+  // interpreter via ShouldFallback -- the "fallback-only" degradation
+  // contract. The count is kept for diagnostics even when the opcodes are
+  // undefined at the current revision (pre-Osaka), where both engines agree
+  // on EVMC_UNDEFINED_INSTRUCTION.
+  size_t AuthOpcodeCount = 0;
 #ifdef ZEN_ENABLE_EVM_MEMORY_PLAN_FRAMEWORK
   bool HasMemoryPlanningRoot = false;
   bool RequiresMemoryEffectFacts = false;
@@ -784,11 +792,33 @@ private:
     size_t CurConsecutiveExpensive = 0;
     size_t CurBlockExpensiveCount = 0;
     bool PrevWasDup = false;
+    // EIP-3074 fallback-only marker: set when the scan sees a defined
+    // AUTH/AUTHCALL opcode.  OR-ed into the final verdict below, because the
+    // threshold expression unconditionally assigns ShouldFallback afterwards.
+    bool ForceFallbackAuth = false;
 
     size_t PCIndex = 0;
     while (PCIndex < BytecodeSize) {
       evmc_opcode Opcode = static_cast<evmc_opcode>(Bytecode[PCIndex]);
       uint8_t OpcodeU8 = static_cast<uint8_t>(Opcode);
+
+      // EIP-3074 AUTH/OP_AUTH + AUTHCALL/OP_AUTHCALL: the JIT frontend has no
+      // MIR lowering for these protocol-extension opcodes (fallback-only
+      // degradation). When the opcode is defined at the module's revision
+      // (OSAKA+), the module must run on the interpreter; the VM consults
+      // JITSuitabilityResult::ShouldFallback at EVMModule load (see
+      // EVMModule::newEVMModule) and in execute() to route the module to the
+      // interpreter fast path. At pre-Osaka revisions the opcodes are
+      // undefined, and both engines already agree on
+      // EVMC_UNDEFINED_INSTRUCTION, so no fallback is forced there.
+      if (OpcodeU8 == static_cast<uint8_t>(evmc_opcode::OP_AUTH) ||
+          OpcodeU8 == static_cast<uint8_t>(evmc_opcode::OP_AUTHCALL)) {
+        ++JITResult.AuthOpcodeCount;
+        if (InstructionNames != nullptr &&
+            InstructionNames[OpcodeU8] != nullptr) {
+          ForceFallbackAuth = true;
+        }
+      }
 
 #ifdef ZEN_ENABLE_EVM_MEMORY_PLAN_FRAMEWORK
       const bool IsDefined =
@@ -842,7 +872,7 @@ private:
     JITResult.MaxBlockExpensiveCount =
         std::max(JITResult.MaxBlockExpensiveCount, CurBlockExpensiveCount);
 
-    JITResult.ShouldFallback =
+    JITResult.ShouldFallback = ForceFallbackAuth ||
         BytecodeSize > MAX_JIT_BYTECODE_SIZE ||
         JITResult.MirEstimate > MAX_JIT_MIR_ESTIMATE ||
         JITResult.MaxConsecutiveExpensive > MAX_CONSECUTIVE_RA_EXPENSIVE ||
