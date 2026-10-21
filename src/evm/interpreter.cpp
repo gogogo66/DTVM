@@ -129,6 +129,36 @@ executePopOpcodeNoGas(zen::evm::EVMFrame *Frame,
   --Frame->Sp;
 }
 
+// RJUMP opcode (EIP-4200).  The pinned evmc fork (DTVMStack/evmc) does not
+// define an OP_RJUMP enumerator yet, so all three interpreter dispatch paths
+// share this cast constant.  Activation (revision >= EVMC_EXPERIMENTAL) is
+// gated by the existing evmc names table mechanism just like every other
+// opcode, so no revision check belongs here; gas (2) is read from the evmc
+// metrics table.
+static constexpr evmc_opcode OP_RJUMP = static_cast<evmc_opcode>(0xe0);
+
+// EIP-4200 RJUMP semantics shared by the computed-goto, fallback-switch and
+// plain dispatch paths: 16-bit big-endian immediate, sign-extended to the
+// jump offset, PC = PC + 3 + signExtend(imm), no stack operands.  Returns
+// false when the immediate is truncated by the code end or the destination
+// falls outside [0, CodeSize); callers raise EVMC_BAD_JUMP_DESTINATION,
+// matching the JUMP handlers' out-of-bounds behavior.
+static ZEN_EVM_INTERP_HELPER bool
+resolveRJumpDestination(const zen::common::Byte *Code, size_t CodeSize,
+                        uint64_t Pc, uint64_t &OutDest) {
+  if (Pc > CodeSize || CodeSize - Pc < 3) {
+    return false;
+  }
+  const int32_t Imm = static_cast<int32_t>(static_cast<int16_t>(
+      (static_cast<uint16_t>(Code[Pc + 1]) << 8) | Code[Pc + 2]));
+  const int64_t NextPc = static_cast<int64_t>(Pc) + 3 + Imm;
+  if (NextPc < 0 || static_cast<uint64_t>(NextPc) >= CodeSize) {
+    return false;
+  }
+  OutDest = static_cast<uint64_t>(NextPc);
+  return true;
+}
+
 static ZEN_EVM_INTERP_HELPER void executeDupOpcode(
     zen::evm::EVMFrame *Frame, zen::evm::InterpreterExecContext &Context,
     const evmc_instruction_metrics *MetricsTable, uint8_t OpcodeU8) {
@@ -503,6 +533,10 @@ void BaseInterpreter::interpret() {
             base[i] = &&TARGET_SWAPX;
           for (int i = 0xa0; i <= 0xa4; i++)
             base[i] = &&TARGET_LOGX;
+          // RJUMP (EIP-4200): per-revision activation is decided below by the
+          // evmc names table (cgoto_tables[rev][i] = names[i] ? base[i] :
+          // undef), so no runtime Revision check is needed; see TARGET_RJUMP.
+          base[0xe0] = &&TARGET_RJUMP;
           base[0xf0] = &&TARGET_CREATEX;
           base[0xf1] = &&TARGET_CALLX;
           base[0xf2] = &&TARGET_CALLX;
@@ -769,6 +803,23 @@ void BaseInterpreter::interpret() {
           goto cgoto_error;
         }
         if (INTX_UNLIKELY(JumpDestMap[Dest] == 0)) {
+          Context.setStatus(EVMC_BAD_JUMP_DESTINATION);
+          goto cgoto_error;
+        }
+        Pc = Dest;
+        Frame->Sp = sp;
+        Frame->Pc = Pc;
+        goto cgoto_restart;
+      }
+      TARGET_RJUMP : {
+        // Revision gating is enforced by cgoto_table (opcodes missing from
+        // evmc_get_instruction_names_table() map to TARGET_UNDEFINED), so no
+        // extra runtime Revision check is needed, matching TARGET_CLZ/PUSH0.
+        // Semantics (EIP-4200): PC = PC + 3 + signExtend(imm16be), no stack
+        // operands; out-of-bounds destinations are rejected like JUMP.
+        uint64_t Dest = 0;
+        if (INTX_UNLIKELY(
+                !resolveRJumpDestination(Code, CodeSize, Pc, Dest))) {
           Context.setStatus(EVMC_BAD_JUMP_DESTINATION);
           goto cgoto_error;
         }
@@ -1317,6 +1368,17 @@ void BaseInterpreter::interpret() {
           break;
         }
 
+        case OP_RJUMP: { // RJUMP (EIP-4200), revision-gated by NamesTable
+          uint64_t Dest = 0;
+          if (!resolveRJumpDestination(Code, CodeSize, Frame->Pc, Dest)) {
+            Context.setStatus(EVMC_BAD_JUMP_DESTINATION);
+            break;
+          }
+          Frame->Pc = Dest;
+          RestartDispatch = true;
+          break;
+        }
+
         case evmc_opcode::OP_PC:
           PCHandler::doExecute();
           break;
@@ -1840,6 +1902,20 @@ void BaseInterpreter::interpret() {
         break;
       }
 
+      Frame->Pc = Dest;
+      continue;
+    }
+
+    case OP_RJUMP: { // RJUMP (EIP-4200), revision-gated by NamesTable
+      if (!chargeGas(Frame, Context, MetricsTable,
+                     static_cast<uint8_t>(OpcodeByte))) {
+        break;
+      }
+      uint64_t Dest = 0;
+      if (!resolveRJumpDestination(Code, CodeSize, Frame->Pc, Dest)) {
+        Context.setStatus(EVMC_BAD_JUMP_DESTINATION);
+        break;
+      }
       Frame->Pc = Dest;
       continue;
     }

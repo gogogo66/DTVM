@@ -1,0 +1,6 @@
+// Forward RJUMP +1 (PC0 -> PC4) skips STOP at PC3; backward RJUMP at PC4 with
+// 0xFFFC (sign-extends to -4) targets PC = 4 + 3 - 4 = 3, landing on STOP.
+// Exercises the negative 16-bit displacement path.
+HEX e00001
+STOP
+HEX e0fffc

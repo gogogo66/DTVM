@@ -1,0 +1,3 @@
+// Zero displacement: PC = 0 + 3 + 0 = 3, landing on the trailing STOP.
+HEX e00000
+STOP

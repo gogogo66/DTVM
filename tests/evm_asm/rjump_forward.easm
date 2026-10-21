@@ -1,0 +1,5 @@
+// RJUMP (EIP-4200, 0xe0): forward jump, PC = 0 + 3 + 1 = 4, skipping INVALID at PC3.
+// Unlike JUMP, RJUMP does not require a JUMPDEST, and it does not touch the stack.
+HEX e00001
+INVALID
+STOP

@@ -1,0 +1,3 @@
+// 0x8000 sign-extends to -32768, so target PC = 0 + 3 - 32768 < 0: invalid target.
+HEX e08000
+STOP

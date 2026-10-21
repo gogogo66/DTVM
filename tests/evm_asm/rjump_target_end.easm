@@ -1,0 +1,4 @@
+// Boundary: target PC = 0 + 3 + 1 = 4 equals code length (4 bytes), i.e. one past
+// the last byte -> exceptional halt (EVMC_BAD_JUMP_DESTINATION).
+HEX e00001
+STOP
