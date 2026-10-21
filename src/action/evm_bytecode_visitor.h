@@ -963,6 +963,22 @@ private:
           break;
         }
 
+        // EIP-3074 AUTH/AUTHCALL (protocol extension, Osaka-gated): the
+        // frontend has no MIR lowering for these opcodes.  The module-level
+        // suitability pass (EVMAnalyzer::analyzeSuitability) routes modules
+        // containing them to the interpreter, so reaching this case means the
+        // gate was bypassed (e.g. a direct compile call).  Fail compilation
+        // so EagerEVMJITCompiler::compile marks the module
+        // ShouldFallbackToInterp -- never emit a misleading
+        // EVMC_UNDEFINED_INSTRUCTION for a defined Osaka opcode.
+        case OP_AUTH:
+        case OP_AUTHCALL: {
+          handleEndBlock();
+          throw std::logic_error(
+              "AUTH/AUTHCALL have no JIT lowering; module must fall back to "
+              "the interpreter (fallback-only degradation)");
+        }
+
         default:
           // Treat as undefined
           handleEndBlock();
